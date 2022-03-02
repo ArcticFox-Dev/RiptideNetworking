@@ -21,7 +21,7 @@ namespace RiptideNetworking
         /// <param name="groupId">The ID of the group of message handlers this method belongs to.</param>
         /// <remarks>
         ///   <para>
-        ///     <see cref="Server"/> instances will include this method in their message handlers if its signature matches that of <see cref="Server.MessageHandler"/>.<br/>
+        ///     <see cref="Server"/> instances will include this method in their message handlers if its signature matches that of <see cref="Server.ServerMessageHandler"/>.<br/>
         ///     <see cref="Client"/> instances will include this method in their message handlers if its signature matches that of <see cref="Client.MessageHandler"/>.
         ///   </para>
         /// </remarks>

@@ -22,7 +22,7 @@ namespace RiptideNetworking.Utils
     }
 
     /// <summary>Provides functionality for logging messages.</summary>
-    public class RiptideLogger
+    public static class RiptideLogger
     {
         /// <summary>Whether or not <see cref="LogType.debug"/> messages will be logged.</summary>
         public static bool IsDebugLoggingEnabled => logMethods.ContainsKey(LogType.debug);
