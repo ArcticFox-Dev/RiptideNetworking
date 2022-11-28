@@ -1,50 +1,72 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2021 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
+﻿// This file is provided under The MIT License as part of RiptideNetworking.
+// Copyright (c) Tom Weiland
+// For additional information please see the included LICENSE.md file or view it on GitHub:
+// https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
 
-using RiptideNetworking.Transports;
-using RiptideNetworking.Utils;
+using Riptide.Transports;
+using Riptide.Utils;
 using System;
 using System.Collections.Generic;
 using System.Text;
 
-namespace RiptideNetworking
+namespace Riptide
 {
     /// <summary>The send mode of a <see cref="Message"/>.</summary>
     public enum MessageSendMode : byte
     {
         /// <summary>Unreliable send mode.</summary>
-        unreliable = HeaderType.unreliable,
+        Unreliable = MessageHeader.Unreliable,
         /// <summary>Reliable send mode.</summary>
-        reliable = HeaderType.reliable,
+        Reliable = MessageHeader.Reliable,
     }
 
     /// <summary>Provides functionality for converting data to bytes and vice versa.</summary>
     public class Message
     {
-        /// <summary>The maximum amount of bytes that a message can contain. Includes a 1 byte header.</summary>
-        public const int MaxMessageSize = 1250;
+        /// <summary>The maximum number of bytes required for a message's header.</summary>
+        /// <remarks>1 byte for the actual header, 2 bytes for the sequence ID (only for reliable messages), 2 bytes for the message ID. Messages sent unreliably will use 2 bytes less than this value for the header.</remarks>
+        public const int MaxHeaderSize = 5;
+        /// <summary>The maximum number of bytes that a message can contain, including the <see cref="MaxHeaderSize"/>.</summary>
+        public static int MaxSize { get; private set; } = MaxHeaderSize + 1225;
+        /// <summary>The maximum number of bytes of payload data that a message can contain. This value represents how many bytes can be added to a message <i>on top of</i> the <see cref="MaxHeaderSize"/>.</summary>
+        public static int MaxPayloadSize
+        {
+            get => MaxSize - MaxHeaderSize;
+            set
+            {
+                if (Peer.ActiveCount > 0)
+                    RiptideLogger.Log(LogType.Error, $"Changing the max message size is not allowed while a {nameof(Server)} or {nameof(Client)} is running!");
+                else
+                {
+                    if (value < 0)
+                    {
+                        RiptideLogger.Log(LogType.Error, $"The max payload size cannot be negative! Setting it to 0 instead of the given value ({value}).");
+                        MaxSize = MaxHeaderSize;
+                    }
+                    else
+                        MaxSize = MaxHeaderSize + value;
+
+                    TrimPool(); // When ActiveSocketCount is 0, this clears the pool
+                }
+            }
+        }
 
         /// <summary>How many messages to add to the pool for each <see cref="Server"/> or <see cref="Client"/> instance that is started.</summary>
         /// <remarks>Changes will not affect <see cref="Server"/> and <see cref="Client"/> instances which are already running until they are restarted.</remarks>
-        public static byte InstancesPerSocket { get; set; } = 4;
+        public static byte InstancesPerPeer { get; set; } = 4;
         /// <summary>A pool of reusable message instances.</summary>
-        private static readonly List<Message> pool = new List<Message>();
+        private static readonly List<Message> pool = new List<Message>(InstancesPerPeer * 2);
 
         /// <summary>The message's send mode.</summary>
         public MessageSendMode SendMode { get; private set; }
-        /// <summary>How often to try sending the message before giving up.</summary>
-        /// <remarks>The default RUDP transport only uses this when sending messages with their <see cref="SendMode"/> set to <see cref="MessageSendMode.reliable"/>. Other transports may ignore this property entirely.</remarks>
-        public int MaxSendAttempts { get; set; }
-        /// <summary>The message's data.</summary>
-        public byte[] Bytes { get; private set; }
         /// <summary>The length in bytes of the unread data contained in the message.</summary>
         public int UnreadLength => writePos - readPos;
         /// <summary>The length in bytes of the data that has been written to the message.</summary>
         public int WrittenLength => writePos;
         /// <summary>How many more bytes can be written into the packet.</summary>
         internal int UnwrittenLength => Bytes.Length - writePos;
+        /// <summary>The message's data.</summary>
+        internal byte[] Bytes { get; private set; }
 
         /// <summary>The position in the byte array that the next bytes will be written to.</summary>
         private ushort writePos = 0;
@@ -53,31 +75,27 @@ namespace RiptideNetworking
 
         /// <summary>Initializes a reusable <see cref="Message"/> instance.</summary>
         /// <param name="maxSize">The maximum amount of bytes the message can contain.</param>
-        private Message(int maxSize = MaxMessageSize) => Bytes = new byte[maxSize];
+        private Message(int maxSize) => Bytes = new byte[maxSize];
 
         #region Pooling
-        /// <summary>Increases the amount of messages in the pool. For use when a new <see cref="Server"/> or <see cref="Client"/> is started.</summary>
-        internal static void IncreasePoolCount()
+        /// <summary>Trims the message pool to a more appropriate size for how many <see cref="Server"/> and/or <see cref="Client"/> instances are currently running.</summary>
+        public static void TrimPool()
         {
-            lock (pool)
+            if (Peer.ActiveCount == 0)
             {
-                pool.Capacity += InstancesPerSocket * 2; // x2 so there's room for extra Message instance in the event that more are needed
-
-                for (int i = 0; i < InstancesPerSocket; i++)
-                    pool.Add(new Message());
+                // No Servers or Clients are running, empty the list and reset the capacity
+                pool.Clear();
+                pool.Capacity = InstancesPerPeer * 2; // x2 so there's some buffer room for extra Message instances in the event that more are needed
             }
-        }
-
-        /// <summary>Decreases the amount of messages in the pool. For use when a <see cref="Server"/> or <see cref="Client"/> is stopped.</summary>
-        internal static void DecreasePoolCount()
-        {
-            lock (pool)
+            else
             {
-                if (pool.Count < InstancesPerSocket)
-                    return;
-
-                for (int i = 0; i < InstancesPerSocket; i++)
-                    pool.RemoveAt(0);
+                // Reset the pool capacity and number of Message instances in the pool to what is appropriate for how many Servers & Clients are active
+                int idealInstanceAmount = Peer.ActiveCount * InstancesPerPeer;
+                if (pool.Count > idealInstanceAmount)
+                {
+                    pool.RemoveRange(Peer.ActiveCount * InstancesPerPeer, pool.Count - idealInstanceAmount);
+                    pool.Capacity = idealInstanceAmount * 2;
+                }
             }
         }
 
@@ -90,26 +108,23 @@ namespace RiptideNetworking
         /// <summary>Gets a message instance that can be used for sending.</summary>
         /// <param name="sendMode">The mode in which the message should be sent.</param>
         /// <param name="id">The message ID.</param>
-        /// <param name="maxSendAttempts">How often to try sending the message before giving up.</param>
-        /// <param name="shouldAutoRelay">Whether or not <see cref="Server"/> instances should automatically relay this message to all other clients. This has no effect when <see cref="Server.AllowAutoMessageRelay"/> is set to <see langword="false"/> and does not affect how clients handle messages.</param>
         /// <returns>A message instance ready to be used for sending.</returns>
-        public static Message Create(MessageSendMode sendMode, ushort id, int maxSendAttempts = 15, bool shouldAutoRelay = false)
+        public static Message Create(MessageSendMode sendMode, ushort id)
         {
-            return RetrieveFromPool().PrepareForUse(shouldAutoRelay ? (HeaderType)sendMode + 1 : (HeaderType)sendMode, maxSendAttempts).Add(id);
+            return RetrieveFromPool().PrepareForUse((MessageHeader)sendMode).AddUShort(id);
         }
-        /// <inheritdoc cref="Create(MessageSendMode, ushort, int, bool)"/>
+        /// <inheritdoc cref="Create(MessageSendMode, ushort)"/>
         /// <remarks>NOTE: <paramref name="id"/> will be cast to a <see cref="ushort"/>. You should ensure that its value never exceeds that of <see cref="ushort.MaxValue"/>, otherwise you'll encounter unexpected behaviour when handling messages.</remarks>
-        public static Message Create(MessageSendMode sendMode, Enum id, int maxSendAttempts = 15, bool shouldAutoRelay = false)
+        public static Message Create(MessageSendMode sendMode, Enum id)
         {
-            return Create(sendMode, (ushort)(object)id, maxSendAttempts, shouldAutoRelay);
+            return Create(sendMode, (ushort)(object)id);
         }
         /// <summary>Gets a message instance that can be used for sending.</summary>
-        /// <param name="messageHeader">The message's header type.</param>
-        /// <param name="maxSendAttempts">How often to try sending the message before giving up.</param>
+        /// <param name="header">The message's header type.</param>
         /// <returns>A message instance ready to be used for sending.</returns>
-        internal static Message Create(HeaderType messageHeader, int maxSendAttempts = 15)
+        internal static Message Create(MessageHeader header)
         {
-            return RetrieveFromPool().PrepareForUse(messageHeader, maxSendAttempts);
+            return RetrieveFromPool().PrepareForUse(header);
         }
 
         /// <summary>Gets a message instance directly from the pool without doing any extra setup.</summary>
@@ -124,32 +139,26 @@ namespace RiptideNetworking
         /// <returns>A message instance ready to be used for sending or handling.</returns>
         private static Message RetrieveFromPool()
         {
-            lock (pool)
+            Message message;
+            if (pool.Count > 0)
             {
-                Message message;
-                if (pool.Count > 0)
-                {
-                    message = pool[0];
-                    pool.RemoveAt(0);
-                }
-                else
-                    message = new Message();
-
-                return message;
+                message = pool[0];
+                pool.RemoveAt(0);
             }
+            else
+                message = new Message(MaxSize);
+
+            return message;
         }
 
         /// <summary>Returns the message instance to the internal pool so it can be reused.</summary>
         public void Release()
         {
-            lock (pool)
+            if (pool.Count < pool.Capacity)
             {
-                if (pool.Count < pool.Capacity)
-                {
-                    // Pool exists and there's room
-                    if (!pool.Contains(this))
-                        pool.Add(this); // Only add it if it's not already in the list, otherwise this method being called twice in a row for whatever reason could cause *serious* issues
-                }
+                // Pool exists and there's room
+                if (!pool.Contains(this))
+                    pool.Add(this); // Only add it if it's not already in the list, otherwise this method being called twice in a row for whatever reason could cause *serious* issues
             }
         }
         #endregion
@@ -159,136 +168,142 @@ namespace RiptideNetworking
         /// <returns>The message, ready to be used.</returns>
         private Message PrepareForUse()
         {
-            SetReadWritePos(0, 0);
+            readPos = 0;
+            writePos = 0;
             return this;
         }
         /// <summary>Prepares the message to be used for sending.</summary>
-        /// <param name="messageHeader">The header of the message.</param>
-        /// <param name="maxSendAttempts">How often to try sending the message before giving up.</param>
+        /// <param name="header">The header of the message.</param>
         /// <returns>The message, ready to be used for sending.</returns>
-        private Message PrepareForUse(HeaderType messageHeader, int maxSendAttempts)
+        private Message PrepareForUse(MessageHeader header)
         {
-            MaxSendAttempts = maxSendAttempts;
-            SetReadWritePos(0, 1);
-            SetHeader(messageHeader);
+            SetHeader(header);
             return this;
         }
         /// <summary>Prepares the message to be used for handling.</summary>
-        /// <param name="messageHeader">The header of the message.</param>
+        /// <param name="header">The header of the message.</param>
         /// <param name="contentLength">The number of bytes that this message contains and which can be retrieved.</param>
         /// <returns>The message, ready to be used for handling.</returns>
-        internal Message PrepareForUse(HeaderType messageHeader, ushort contentLength)
+        internal Message PrepareForUse(MessageHeader header, ushort contentLength)
         {
-            SetReadWritePos(1, contentLength);
-            SetHeader(messageHeader);
+            SetHeader(header);
+            writePos = contentLength;
             return this;
         }
 
-        /// <summary>Sets the message's read and write position.</summary>
-        /// <param name="newReadPos">The new read position.</param>
-        /// <param name="newWritePos">The new write position.</param>
-        private void SetReadWritePos(ushort newReadPos, ushort newWritePos)
+        /// <summary>Sets the message's header byte to the given <paramref name="header"/> and determines the appropriate <see cref="MessageSendMode"/> and read/write positions.</summary>
+        /// <param name="header">The header to use for this message.</param>
+        internal void SetHeader(MessageHeader header)
         {
-            readPos = newReadPos;
-            writePos = newWritePos;
-        }
-
-        /// <summary>Sets the message's header byte to the given <paramref name="messageHeader"/> and determines the appropriate <see cref="MessageSendMode"/>.</summary>
-        /// <param name="messageHeader">The header to use for this message.</param>
-        internal void SetHeader(HeaderType messageHeader)
-        {
-            Bytes[0] = (byte)messageHeader;
-            SendMode = messageHeader >= HeaderType.reliable ? MessageSendMode.reliable : MessageSendMode.unreliable;
+            Bytes[0] = (byte)header;
+            if (header >= MessageHeader.Reliable)
+            {
+                readPos = 3;
+                writePos = 3;
+                SendMode = MessageSendMode.Reliable;
+            }
+            else
+            {
+                readPos = 1;
+                writePos = 1;
+                SendMode = MessageSendMode.Unreliable;
+            }
         }
         #endregion
 
         #region Add & Retrieve Data
-        #region Byte
-        /// <inheritdoc cref="Add(byte)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(byte)"/> and simply provides an alternative type-explicit way to add a <see cref="byte"/> to the message.</remarks>
-        public Message AddByte(byte value) => Add(value);
-
+        #region Byte & SByte
         /// <summary>Adds a single <see cref="byte"/> to the message.</summary>
         /// <param name="value">The <see cref="byte"/> to add.</param>
         /// <returns>The message that the <see cref="byte"/> was added to.</returns>
-        public Message Add(byte value)
+        public Message AddByte(byte value)
         {
             if (UnwrittenLength < 1)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'byte'!");
+                throw new InsufficientCapacityException(this, ByteName, 1);
 
             Bytes[writePos++] = value;
             return this;
         }
 
-        /// <summary>Retrieves a <see cref="byte"/> from the message.</summary>
+        /// <summary>Adds a single <see cref="sbyte"/> to the message.</summary>
+        /// <param name="value">The <see cref="sbyte"/> to add.</param>
+        /// <returns>The message that the <see cref="sbyte"/> was added to.</returns>
+        public Message AddSByte(sbyte value)
+        {
+            if (UnwrittenLength < 1)
+                throw new InsufficientCapacityException(this, SByteName, 1);
+
+            Bytes[writePos++] = (byte)value;
+            return this;
+        }
+
+        /// <summary>Retrieves a single <see cref="byte"/> from the message.</summary>
         /// <returns>The <see cref="byte"/> that was retrieved.</returns>
         public byte GetByte()
         {
             if (UnreadLength < 1)
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'byte', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(ByteName));
                 return 0;
             }
             
             return Bytes[readPos++]; // Get the byte at readPos' position
         }
 
-        /// <inheritdoc cref="Add(byte[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(byte[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="byte"/> array to the message.</remarks>
-        public Message AddBytes(byte[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
-        /// <summary>Adds a <see cref="byte"/> array to the message.</summary>
-        /// <param name="array">The <see cref="byte"/> array to add.</param>
-        /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="byte"/> array was added to.</returns>
-        public Message Add(byte[] array, bool includeLength = true, bool isBigArray = false)
+        /// <summary>Retrieves a single <see cref="sbyte"/> from the message.</summary>
+        /// <returns>The <see cref="sbyte"/> that was retrieved.</returns>
+        public sbyte GetSByte()
         {
-            if (includeLength)
+            if (UnreadLength < 1)
             {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetBytes to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(SByteName));
+                return 0;
             }
 
+            return (sbyte)Bytes[readPos++]; // Get the sbyte at readPos' position
+        }
+
+        /// <summary>Adds a <see cref="byte"/> array to the message.</summary>
+        /// <param name="array">The array to add.</param>
+        /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddBytes(byte[] array, bool includeLength = true)
+        {
+            if (includeLength)
+                AddArrayLength(array.Length);
+
             if (UnwrittenLength < array.Length)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'byte[]'!");
+                throw new InsufficientCapacityException(this, array.Length, ByteName, 1);
 
             Array.Copy(array, 0, Bytes, writePos, array.Length);
             writePos += (ushort)array.Length;
             return this;
         }
 
-        /// <summary>Retrieves a <see cref="byte"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="byte"/> array that was retrieved.</returns>
-        public byte[] GetBytes(bool isBigArray = false)
+        /// <summary>Adds an <see cref="sbyte"/> array to the message.</summary>
+        /// <param name="array">The array to add.</param>
+        /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddSBytes(sbyte[] array, bool includeLength = true)
         {
-            if (isBigArray)
-                return GetBytes(GetUShort());
-            else
-                return GetBytes(GetByte());
+            if (includeLength)
+                AddArrayLength(array.Length);
+
+            if (UnwrittenLength < array.Length)
+                throw new InsufficientCapacityException(this, array.Length, SByteName, 1);
+
+            for (int i = 0; i < array.Length; i++)
+                Bytes[writePos++] = (byte)array[i];
+            
+            return this;
         }
+
+        /// <summary>Retrieves a <see cref="byte"/> array from the message.</summary>
+        /// <returns>The array that was retrieved.</returns>
+        public byte[] GetBytes() => GetBytes(GetArrayLength());
         /// <summary>Retrieves a <see cref="byte"/> array from the message.</summary>
         /// <param name="amount">The amount of bytes to retrieve.</param>
-        /// <returns>The <see cref="byte"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public byte[] GetBytes(int amount)
         {
             byte[] array = new byte[amount];
@@ -297,45 +312,81 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="byte"/> array with bytes retrieved from the message.</summary>
         /// <param name="amount">The amount of bytes to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetBytes(int amount, byte[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetBytes(int amount, byte[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} bytes, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, ByteName));
 
-            ReadBytes(amount, array, startIndex);
+            ReadBytes(amount, intoArray, startIndex);
+        }
+
+        /// <summary>Retrieves an <see cref="sbyte"/> array from the message.</summary>
+        /// <returns>The array that was retrieved.</returns>
+        public sbyte[] GetSBytes() => GetSBytes(GetArrayLength());
+        /// <summary>Retrieves an <see cref="sbyte"/> array from the message.</summary>
+        /// <param name="amount">The amount of sbytes to retrieve.</param>
+        /// <returns>The array that was retrieved.</returns>
+        public sbyte[] GetSBytes(int amount)
+        {
+            sbyte[] array = new sbyte[amount];
+            ReadSBytes(amount, array);
+            return array;
+        }
+        /// <summary>Populates a <see cref="sbyte"/> array with bytes retrieved from the message.</summary>
+        /// <param name="amount">The amount of sbytes to retrieve.</param>
+        /// <param name="intArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating <paramref name="intArray"/>.</param>
+        public void GetSBytes(int amount, sbyte[] intArray, int startIndex = 0)
+        {
+            if (startIndex + amount > intArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intArray.Length, startIndex, SByteName));
+
+            ReadSBytes(amount, intArray, startIndex);
         }
 
         /// <summary>Reads a number of bytes from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of bytes to read.</param>
-        /// <param name="array">The array to write the bytes into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadBytes(int amount, byte[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the bytes into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadBytes(int amount, byte[] intoArray, int startIndex = 0)
         {
             if (UnreadLength < amount)
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'byte[]', array will contain default elements!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, ByteName));
                 amount = UnreadLength;
             }
 
-            Array.Copy(Bytes, readPos, array, startIndex, amount); // Copy the bytes at readPos' position to the array that will be returned
+            Array.Copy(Bytes, readPos, intoArray, startIndex, amount); // Copy the bytes at readPos' position to the array that will be returned
             readPos += (ushort)amount;
+        }
+
+        /// <summary>Reads a number of sbytes from the message and writes them into the given array.</summary>
+        /// <param name="amount">The amount of sbytes to read.</param>
+        /// <param name="intoArray">The array to write the sbytes into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadSBytes(int amount, sbyte[] intoArray, int startIndex = 0)
+        {
+            if (UnreadLength < amount)
+            {
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, SByteName));
+                amount = UnreadLength;
+            }
+
+            for (int i = 0; i < amount; i++)
+                intoArray[startIndex + i] = (sbyte)Bytes[readPos++];
         }
         #endregion
 
         #region Bool
-        /// <inheritdoc cref="Add(bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(bool)"/> and simply provides an alternative type-explicit way to add a <see cref="bool"/> to the message.</remarks>
-        public Message AddBool(bool value) => Add(value);
-
         /// <summary>Adds a <see cref="bool"/> to the message.</summary>
         /// <param name="value">The <see cref="bool"/> to add.</param>
         /// <returns>The message that the <see cref="bool"/> was added to.</returns>
-        public Message Add(bool value)
+        public Message AddBool(bool value)
         {
-            if (UnwrittenLength < RiptideConverter.BoolLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'bool'!");
+            if (UnwrittenLength < sizeof(bool))
+                throw new InsufficientCapacityException(this, BoolName, sizeof(bool));
 
             Bytes[writePos++] = (byte)(value ? 1 : 0);
             return this;
@@ -345,47 +396,27 @@ namespace RiptideNetworking
         /// <returns>The <see cref="bool"/> that was retrieved.</returns>
         public bool GetBool()
         {
-            if (UnreadLength < RiptideConverter.BoolLength)
+            if (UnreadLength < sizeof(bool))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'bool', returning false!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(BoolName, "false"));
                 return false;
             }
             
             return Bytes[readPos++] == 1; // Convert the byte at readPos' position to a bool
         }
 
-        /// <inheritdoc cref="Add(bool[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(bool[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="bool"/> array to the message.</remarks>
-        public Message AddBools(bool[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
         /// <summary>Adds a <see cref="bool"/> array to the message.</summary>
-        /// <param name="array">The <see cref="bool"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="bool"/> array was added to.</returns>
-        public Message Add(bool[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddBools(bool[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetBools to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
             ushort byteLength = (ushort)(array.Length / 8 + (array.Length % 8 == 0 ? 0 : 1));
             if (UnwrittenLength < byteLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'bool[]'!");
+                throw new InsufficientCapacityException(this, array.Length, BoolName, sizeof(bool), byteLength);
 
             // Pack 8 bools into each byte
             bool isLengthMultipleOf8 = array.Length % 8 == 0;
@@ -407,24 +438,11 @@ namespace RiptideNetworking
         }
 
         /// <summary>Retrieves a <see cref="bool"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="bool"/> array that was retrieved.</returns>
-        public bool[] GetBools(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetBools(GetUShort());
-            else
-                return GetBools(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public bool[] GetBools() => GetBools(GetArrayLength());
         /// <summary>Retrieves a <see cref="bool"/> array from the message.</summary>
         /// <param name="amount">The amount of bools to retrieve.</param>
-        /// <returns>The <see cref="bool"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public bool[] GetBools(int amount)
         {
             bool[] array = new bool[amount];
@@ -432,7 +450,7 @@ namespace RiptideNetworking
             int byteAmount = amount / 8 + (amount % 8 == 0 ? 0 : 1);
             if (UnreadLength < byteAmount)
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'bool[]', array will contain default elements!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(array.Length, BoolName));
                 byteAmount = UnreadLength;
             }
 
@@ -441,36 +459,36 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="bool"/> array with bools retrieved from the message.</summary>
         /// <param name="amount">The amount of bools to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetBools(int amount, bool[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetBools(int amount, bool[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} bools, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, BoolName));
 
             int byteAmount = amount / 8 + (amount % 8 == 0 ? 0 : 1);
             if (UnreadLength < byteAmount)
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'bool[]', array will contain default elements!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, BoolName));
 
-            ReadBools(byteAmount, array, startIndex);
+            ReadBools(byteAmount, intoArray, startIndex);
         }
 
         /// <summary>Reads a number of bools from the message and writes them into the given array.</summary>
         /// <param name="byteAmount">The number of bytes the bools are being stored in.</param>
-        /// <param name="array">The array to write the bools into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadBools(int byteAmount, bool[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the bools into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadBools(int byteAmount, bool[] intoArray, int startIndex = 0)
         {
             // Read 8 bools from each byte
-            bool isLengthMultipleOf8 = array.Length % 8 == 0;
+            bool isLengthMultipleOf8 = intoArray.Length % 8 == 0;
             for (int i = 0; i < byteAmount; i++)
             {
                 int bitsToRead = 8;
                 if ((i + 1) == byteAmount && !isLengthMultipleOf8)
-                    bitsToRead = array.Length % 8;
+                    bitsToRead = intoArray.Length % 8;
 
                 for (int bit = 0; bit < bitsToRead; bit++)
-                    array[startIndex + (i * 8 + bit)] = (Bytes[readPos + i] >> bit & 1) == 1;
+                    intoArray[startIndex + (i * 8 + bit)] = (Bytes[readPos + i] >> bit & 1) == 1;
             }
 
             readPos += (ushort)byteAmount;
@@ -478,37 +496,29 @@ namespace RiptideNetworking
         #endregion
 
         #region Short & UShort
-        /// <inheritdoc cref="Add(short)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(short)"/> and simply provides an alternative type-explicit way to add a <see cref="short"/> to the message.</remarks>
-        public Message AddShort(short value) => Add(value);
-
         /// <summary>Adds a <see cref="short"/> to the message.</summary>
         /// <param name="value">The <see cref="short"/> to add.</param>
         /// <returns>The message that the <see cref="short"/> was added to.</returns>
-        public Message Add(short value)
+        public Message AddShort(short value)
         {
-            if (UnwrittenLength < RiptideConverter.ShortLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'short'!");
+            if (UnwrittenLength < sizeof(short))
+                throw new InsufficientCapacityException(this, ShortName, sizeof(short));
 
-            RiptideConverter.FromShort(value, Bytes, writePos);
-            writePos += RiptideConverter.ShortLength;
+            Converter.FromShort(value, Bytes, writePos);
+            writePos += sizeof(short);
             return this;
         }
-
-        /// <inheritdoc cref="Add(ushort)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(ushort)"/> and simply provides an alternative type-explicit way to add a <see cref="ushort"/> to the message.</remarks>
-        public Message AddUShort(ushort value) => Add(value);
 
         /// <summary>Adds a <see cref="ushort"/> to the message.</summary>
         /// <param name="value">The <see cref="ushort"/> to add.</param>
         /// <returns>The message that the <see cref="ushort"/> was added to.</returns>
-        public Message Add(ushort value)
+        public Message AddUShort(ushort value)
         {
-            if (UnwrittenLength < RiptideConverter.UShortLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'ushort'!");
+            if (UnwrittenLength < sizeof(ushort))
+                throw new InsufficientCapacityException(this, UShortName, sizeof(ushort));
 
-            RiptideConverter.FromUShort(value, Bytes, writePos);
-            writePos += RiptideConverter.UShortLength;
+            Converter.FromUShort(value, Bytes, writePos);
+            writePos += sizeof(ushort);
             return this;
         }
 
@@ -516,14 +526,14 @@ namespace RiptideNetworking
         /// <returns>The <see cref="short"/> that was retrieved.</returns>
         public short GetShort()
         {
-            if (UnreadLength < RiptideConverter.ShortLength)
+            if (UnreadLength < sizeof(short))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'short', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(ShortName));
                 return 0;
             }
 
-            short value = RiptideConverter.ToShort(Bytes, readPos);
-            readPos += RiptideConverter.ShortLength;
+            short value = Converter.ToShort(Bytes, readPos);
+            readPos += sizeof(short);
             return value;
         }
 
@@ -531,124 +541,59 @@ namespace RiptideNetworking
         /// <returns>The <see cref="ushort"/> that was retrieved.</returns>
         public ushort GetUShort()
         {
-            if (UnreadLength < RiptideConverter.UShortLength)
+            if (UnreadLength < sizeof(ushort))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'ushort', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(UShortName));
                 return 0;
             }
 
-            ushort value = RiptideConverter.ToUShort(Bytes, readPos);
-            readPos += RiptideConverter.UShortLength;
+            ushort value = Converter.ToUShort(Bytes, readPos);
+            readPos += sizeof(ushort);
             return value;
         }
         
-        /// <summary>Retrieves a <see cref="ushort"/> from the message without moving the read position, allowing the same bytes to be read again.</summary>
-        internal ushort PeekUShort()
-        {
-            if (UnreadLength < RiptideConverter.UShortLength)
-            {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to peek type 'ushort', returning 0!");
-                return 0;
-            }
-
-            return RiptideConverter.ToUShort(Bytes, readPos);
-        }
-
-        /// <inheritdoc cref="Add(short[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(short[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="short"/> array to the message.</remarks>
-        public Message AddShorts(short[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
         /// <summary>Adds a <see cref="short"/> array to the message.</summary>
-        /// <param name="array">The <see cref="short"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="short"/> array was added to.</returns>
-        public Message Add(short[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddShorts(short[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetShorts to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.ShortLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'short[]'!");
+            if (UnwrittenLength < array.Length * sizeof(short))
+                throw new InsufficientCapacityException(this, array.Length, ShortName, sizeof(short));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddShort(array[i]);
 
             return this;
         }
-
-        /// <inheritdoc cref="Add(ushort[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(ushort[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="ushort"/> array to the message.</remarks>
-        public Message AddUShorts(ushort[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
 
         /// <summary>Adds a <see cref="ushort"/> array to the message.</summary>
-        /// <param name="array">The <see cref="ushort"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="ushort"/> array was added to.</returns>
-        public Message Add(ushort[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddUShorts(ushort[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetUShorts to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.UShortLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'ushort[]'!");
+            if (UnwrittenLength < array.Length * sizeof(ushort))
+                throw new InsufficientCapacityException(this, array.Length, UShortName, sizeof(ushort));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddUShort(array[i]);
 
             return this;
         }
 
         /// <summary>Retrieves a <see cref="short"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="short"/> array that was retrieved.</returns>
-        public short[] GetShorts(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetShorts(GetUShort());
-            else
-                return GetShorts(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public short[] GetShorts() => GetShorts(GetArrayLength());
         /// <summary>Retrieves a <see cref="short"/> array from the message.</summary>
         /// <param name="amount">The amount of shorts to retrieve.</param>
-        /// <returns>The <see cref="short"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public short[] GetShorts(int amount)
         {
             short[] array = new short[amount];
@@ -657,35 +602,22 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="short"/> array with shorts retrieved from the message.</summary>
         /// <param name="amount">The amount of shorts to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetShorts(int amount, short[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetShorts(int amount, short[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} shorts, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, ShortName));
 
-            ReadShorts(amount, array, startIndex);
+            ReadShorts(amount, intoArray, startIndex);
         }
 
         /// <summary>Retrieves a <see cref="ushort"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="ushort"/> array that was retrieved.</returns>
-        public ushort[] GetUShorts(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetUShorts(GetUShort());
-            else
-                return GetUShorts(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public ushort[] GetUShorts() => GetUShorts(GetArrayLength());
         /// <summary>Retrieves a <see cref="ushort"/> array from the message.</summary>
         /// <param name="amount">The amount of ushorts to retrieve.</param>
-        /// <returns>The <see cref="ushort"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public ushort[] GetUShorts(int amount)
         {
             ushort[] array = new ushort[amount];
@@ -694,87 +626,79 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="ushort"/> array with ushorts retrieved from the message.</summary>
         /// <param name="amount">The amount of ushorts to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetUShorts(int amount, ushort[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetUShorts(int amount, ushort[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} ushorts, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, UShortName));
 
-            ReadUShorts(amount, array, startIndex);
+            ReadUShorts(amount, intoArray, startIndex);
         }
 
         /// <summary>Reads a number of shorts from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of shorts to read.</param>
-        /// <param name="array">The array to write the shorts into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadShorts(int amount, short[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the shorts into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadShorts(int amount, short[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.ShortLength)
+            if (UnreadLength < amount * sizeof(short))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'short[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.ShortLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, ShortName));
+                amount = UnreadLength / sizeof(short);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToShort(Bytes, readPos);
-                readPos += RiptideConverter.ShortLength;
+                intoArray[startIndex + i] = Converter.ToShort(Bytes, readPos);
+                readPos += sizeof(short);
             }
         }
 
         /// <summary>Reads a number of ushorts from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of ushorts to read.</param>
-        /// <param name="array">The array to write the ushorts into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadUShorts(int amount, ushort[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the ushorts into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadUShorts(int amount, ushort[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.UShortLength)
+            if (UnreadLength < amount * sizeof(ushort))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'ushort[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.ShortLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, UShortName));
+                amount = UnreadLength / sizeof(short);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToUShort(Bytes, readPos);
-                readPos += RiptideConverter.UShortLength;
+                intoArray[startIndex + i] = Converter.ToUShort(Bytes, readPos);
+                readPos += sizeof(ushort);
             }
         }
         #endregion
 
         #region Int & UInt
-        /// <inheritdoc cref="Add(int)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(int)"/> and simply provides an alternative type-explicit way to add a <see cref="int"/> to the message.</remarks>
-        public Message AddInt(int value) => Add(value);
-
         /// <summary>Adds an <see cref="int"/> to the message.</summary>
         /// <param name="value">The <see cref="int"/> to add.</param>
         /// <returns>The message that the <see cref="int"/> was added to.</returns>
-        public Message Add(int value)
+        public Message AddInt(int value)
         {
-            if (UnwrittenLength < RiptideConverter.IntLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'int'!");
+            if (UnwrittenLength < sizeof(int))
+                throw new InsufficientCapacityException(this, IntName, sizeof(int));
 
-            RiptideConverter.FromInt(value, Bytes, writePos);
-            writePos += RiptideConverter.IntLength;
+            Converter.FromInt(value, Bytes, writePos);
+            writePos += sizeof(int);
             return this;
         }
-
-        /// <inheritdoc cref="Add(uint)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(uint)"/> and simply provides an alternative type-explicit way to add a <see cref="uint"/> to the message.</remarks>
-        public Message AddUInt(uint value) => Add(value);
 
         /// <summary>Adds a <see cref="uint"/> to the message.</summary>
         /// <param name="value">The <see cref="uint"/> to add.</param>
         /// <returns>The message that the <see cref="uint"/> was added to.</returns>
-        public Message Add(uint value)
+        public Message AddUInt(uint value)
         {
-            if (UnwrittenLength < RiptideConverter.UIntLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'uint'!");
+            if (UnwrittenLength < sizeof(uint))
+                throw new InsufficientCapacityException(this, UIntName, sizeof(uint));
 
-            RiptideConverter.FromUInt(value, Bytes, writePos);
-            writePos += RiptideConverter.UIntLength;
+            Converter.FromUInt(value, Bytes, writePos);
+            writePos += sizeof(uint);
             return this;
         }
 
@@ -782,14 +706,14 @@ namespace RiptideNetworking
         /// <returns>The <see cref="int"/> that was retrieved.</returns>
         public int GetInt()
         {
-            if (UnreadLength < RiptideConverter.IntLength)
+            if (UnreadLength < sizeof(int))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'int', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(IntName));
                 return 0;
             }
 
-            int value = RiptideConverter.ToInt(Bytes, readPos);
-            readPos += RiptideConverter.IntLength;
+            int value = Converter.ToInt(Bytes, readPos);
+            readPos += sizeof(int);
             return value;
         }
 
@@ -797,112 +721,59 @@ namespace RiptideNetworking
         /// <returns>The <see cref="uint"/> that was retrieved.</returns>
         public uint GetUInt()
         {
-            if (UnreadLength < RiptideConverter.UIntLength)
+            if (UnreadLength < sizeof(uint))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'uint', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(UIntName));
                 return 0;
             }
 
-            uint value = RiptideConverter.ToUInt(Bytes, readPos);
-            readPos += RiptideConverter.UIntLength;
+            uint value = Converter.ToUInt(Bytes, readPos);
+            readPos += sizeof(uint);
             return value;
         }
 
-        /// <inheritdoc cref="Add(int[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(int[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="int"/> array to the message.</remarks>
-        public Message AddInts(int[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
         /// <summary>Adds an <see cref="int"/> array message.</summary>
-        /// <param name="array">The <see cref="int"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="int"/> array was added to.</returns>
-        public Message Add(int[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddInts(int[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetInts to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.IntLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'int[]'!");
+            if (UnwrittenLength < array.Length * sizeof(int))
+                throw new InsufficientCapacityException(this, array.Length, IntName, sizeof(int));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddInt(array[i]);
 
             return this;
         }
-
-        /// <inheritdoc cref="Add(uint[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(uint[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="uint"/> array to the message.</remarks>
-        public Message AddUInts(uint[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
 
         /// <summary>Adds a <see cref="uint"/> array to the message.</summary>
-        /// <param name="array">The <see cref="uint"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="uint"/> array was added to.</returns>
-        public Message Add(uint[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddUInts(uint[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetUInts to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.UIntLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'uint[]'!");
+            if (UnwrittenLength < array.Length * sizeof(uint))
+                throw new InsufficientCapacityException(this, array.Length, UIntName, sizeof(uint));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddUInt(array[i]);
 
             return this;
         }
 
         /// <summary>Retrieves an <see cref="int"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="int"/> array that was retrieved.</returns>
-        public int[] GetInts(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetInts(GetUShort());
-            else
-                return GetInts(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public int[] GetInts() => GetInts(GetArrayLength());
         /// <summary>Retrieves an <see cref="int"/> array from the message.</summary>
         /// <param name="amount">The amount of ints to retrieve.</param>
-        /// <returns>The <see cref="int"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public int[] GetInts(int amount)
         {
             int[] array = new int[amount];
@@ -911,35 +782,22 @@ namespace RiptideNetworking
         }
         /// <summary>Populates an <see cref="int"/> array with ints retrieved from the message.</summary>
         /// <param name="amount">The amount of ints to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetInts(int amount, int[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetInts(int amount, int[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} ints, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, IntName));
 
-            ReadInts(amount, array, startIndex);
+            ReadInts(amount, intoArray, startIndex);
         }
 
         /// <summary>Retrieves a <see cref="uint"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="uint"/> array that was retrieved.</returns>
-        public uint[] GetUInts(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetUInts(GetUShort());
-            else
-                return GetUInts(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public uint[] GetUInts() => GetUInts(GetArrayLength());
         /// <summary>Retrieves a <see cref="uint"/> array from the message.</summary>
         /// <param name="amount">The amount of uints to retrieve.</param>
-        /// <returns>The <see cref="uint"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public uint[] GetUInts(int amount)
         {
             uint[] array = new uint[amount];
@@ -948,87 +806,79 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="uint"/> array with uints retrieved from the message.</summary>
         /// <param name="amount">The amount of uints to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetUInts(int amount, uint[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetUInts(int amount, uint[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} uints, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, UIntName));
 
-            ReadUInts(amount, array, startIndex);
+            ReadUInts(amount, intoArray, startIndex);
         }
 
         /// <summary>Reads a number of ints from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of ints to read.</param>
-        /// <param name="array">The array to write the ints into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadInts(int amount, int[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the ints into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadInts(int amount, int[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.IntLength)
+            if (UnreadLength < amount * sizeof(int))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'int[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.IntLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, IntName));
+                amount = UnreadLength / sizeof(int);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToInt(Bytes, readPos);
-                readPos += RiptideConverter.IntLength;
+                intoArray[startIndex + i] = Converter.ToInt(Bytes, readPos);
+                readPos += sizeof(int);
             }
         }
 
         /// <summary>Reads a number of uints from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of uints to read.</param>
-        /// <param name="array">The array to write the uints into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadUInts(int amount, uint[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the uints into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadUInts(int amount, uint[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.UIntLength)
+            if (UnreadLength < amount * sizeof(uint))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'uint[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.UIntLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, UIntName));
+                amount = UnreadLength / sizeof(uint);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToUInt(Bytes, readPos);
-                readPos += RiptideConverter.UIntLength;
+                intoArray[startIndex + i] = Converter.ToUInt(Bytes, readPos);
+                readPos += sizeof(uint);
             }
         }
         #endregion
 
         #region Long & ULong
-        /// <inheritdoc cref="Add(long)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(long)"/> and simply provides an alternative type-explicit way to add a <see cref="long"/> to the message.</remarks>
-        public Message AddLong(long value) => Add(value);
-
         /// <summary>Adds a <see cref="long"/> to the message.</summary>
         /// <param name="value">The <see cref="long"/> to add.</param>
         /// <returns>The message that the <see cref="long"/> was added to.</returns>
-        public Message Add(long value)
+        public Message AddLong(long value)
         {
-            if (UnwrittenLength < RiptideConverter.LongLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'long'!");
+            if (UnwrittenLength < sizeof(long))
+                throw new InsufficientCapacityException(this, LongName, sizeof(long));
 
-            RiptideConverter.FromLong(value, Bytes, writePos);
-            writePos += RiptideConverter.LongLength;
+            Converter.FromLong(value, Bytes, writePos);
+            writePos += sizeof(long);
             return this;
         }
-
-        /// <inheritdoc cref="Add(ulong)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(ulong)"/> and simply provides an alternative type-explicit way to add a <see cref="ulong"/> to the message.</remarks>
-        public Message AddULong(ulong value) => Add(value);
 
         /// <summary>Adds a <see cref="ulong"/> to the message.</summary>
         /// <param name="value">The <see cref="ulong"/> to add.</param>
         /// <returns>The message that the <see cref="ulong"/> was added to.</returns>
-        public Message Add(ulong value)
+        public Message AddULong(ulong value)
         {
-            if (UnwrittenLength < RiptideConverter.ULongLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'ulong'!");
+            if (UnwrittenLength < sizeof(ulong))
+                throw new InsufficientCapacityException(this, ULongName, sizeof(ulong));
 
-            RiptideConverter.FromULong(value, Bytes, writePos);
-            writePos += RiptideConverter.ULongLength;
+            Converter.FromULong(value, Bytes, writePos);
+            writePos += sizeof(ulong);
             return this;
         }
 
@@ -1036,14 +886,14 @@ namespace RiptideNetworking
         /// <returns>The <see cref="long"/> that was retrieved.</returns>
         public long GetLong()
         {
-            if (UnreadLength < RiptideConverter.LongLength)
+            if (UnreadLength < sizeof(long))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'long', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(LongName));
                 return 0;
             }
 
-            long value = RiptideConverter.ToLong(Bytes, readPos);
-            readPos += RiptideConverter.LongLength;
+            long value = Converter.ToLong(Bytes, readPos);
+            readPos += sizeof(long);
             return value;
         }
 
@@ -1051,112 +901,59 @@ namespace RiptideNetworking
         /// <returns>The <see cref="ulong"/> that was retrieved.</returns>
         public ulong GetULong()
         {
-            if (UnreadLength < RiptideConverter.ULongLength)
+            if (UnreadLength < sizeof(ulong))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'ulong', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(ULongName));
                 return 0;
             }
 
-            ulong value = RiptideConverter.ToULong(Bytes, readPos);
-            readPos += RiptideConverter.ULongLength;
+            ulong value = Converter.ToULong(Bytes, readPos);
+            readPos += sizeof(ulong);
             return value;
         }
-
-        /// <inheritdoc cref="Add(long[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(long[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="long"/> array to the message.</remarks>
-        public Message AddLongs(long[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
 
         /// <summary>Adds a <see cref="long"/> array to the message.</summary>
         /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="long"/> array was added to.</returns>
-        public Message Add(long[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddLongs(long[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetLongs to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.LongLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'long[]'!");
+            if (UnwrittenLength < array.Length * sizeof(long))
+                throw new InsufficientCapacityException(this, array.Length, LongName, sizeof(long));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddLong(array[i]);
 
             return this;
         }
-
-        /// <inheritdoc cref="Add(ulong[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(ulong[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="ulong"/> array to the message.</remarks>
-        public Message AddULongs(ulong[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
 
         /// <summary>Adds a <see cref="ulong"/> array to the message.</summary>
-        /// <param name="array">The <see cref="ulong"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="ulong"/> array was added to.</returns>
-        public Message Add(ulong[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddULongs(ulong[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetULongs to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.ULongLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'ulong[]'!");
+            if (UnwrittenLength < array.Length * sizeof(ulong))
+                throw new InsufficientCapacityException(this, array.Length, ULongName, sizeof(ulong));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddULong(array[i]);
 
             return this;
         }
 
         /// <summary>Retrieves a <see cref="long"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="long"/> array that was retrieved.</returns>
-        public long[] GetLongs(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetLongs(GetUShort());
-            else
-                return GetLongs(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public long[] GetLongs() => GetLongs(GetArrayLength());
         /// <summary>Retrieves a <see cref="long"/> array from the message.</summary>
         /// <param name="amount">The amount of longs to retrieve.</param>
-        /// <returns>The <see cref="long"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public long[] GetLongs(int amount)
         {
             long[] array = new long[amount];
@@ -1165,35 +962,22 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="long"/> array with longs retrieved from the message.</summary>
         /// <param name="amount">The amount of longs to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetLongs(int amount, long[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetLongs(int amount, long[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} longs, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, LongName));
 
-            ReadLongs(amount, array, startIndex);
+            ReadLongs(amount, intoArray, startIndex);
         }
 
         /// <summary>Retrieves a <see cref="ulong"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="ulong"/> array that was retrieved.</returns>
-        public ulong[] GetULongs(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetULongs(GetUShort());
-            else
-                return GetULongs(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public ulong[] GetULongs() => GetULongs(GetArrayLength());
         /// <summary>Retrieves a <see cref="ulong"/> array from the message.</summary>
         /// <param name="amount">The amount of ulongs to retrieve.</param>
-        /// <returns>The <see cref="ulong"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public ulong[] GetULongs(int amount)
         {
             ulong[] array = new ulong[amount];
@@ -1202,70 +986,66 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="ulong"/> array with ulongs retrieved from the message.</summary>
         /// <param name="amount">The amount of ulongs to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetULongs(int amount, ulong[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetULongs(int amount, ulong[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} ulongs, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, ULongName));
 
-            ReadULongs(amount, array, startIndex);
+            ReadULongs(amount, intoArray, startIndex);
         }
 
         /// <summary>Reads a number of longs from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of longs to read.</param>
-        /// <param name="array">The array to write the longs into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadLongs(int amount, long[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the longs into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadLongs(int amount, long[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.LongLength)
+            if (UnreadLength < amount * sizeof(long))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'long[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.LongLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, LongName));
+                amount = UnreadLength / sizeof(long);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToLong(Bytes, readPos);
-                readPos += RiptideConverter.LongLength;
+                intoArray[startIndex + i] = Converter.ToLong(Bytes, readPos);
+                readPos += sizeof(long);
             }
         }
 
         /// <summary>Reads a number of ulongs from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of ulongs to read.</param>
-        /// <param name="array">The array to write the ulongs into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadULongs(int amount, ulong[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the ulongs into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadULongs(int amount, ulong[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.ULongLength)
+            if (UnreadLength < amount * sizeof(ulong))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'ulong[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.ULongLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, ULongName));
+                amount = UnreadLength / sizeof(ulong);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToULong(Bytes, readPos);
-                readPos += RiptideConverter.ULongLength;
+                intoArray[startIndex + i] = Converter.ToULong(Bytes, readPos);
+                readPos += sizeof(ulong);
             }
         }
         #endregion
 
         #region Float
-        /// <inheritdoc cref="Add(float)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(float)"/> and simply provides an alternative type-explicit way to add a <see cref="float"/> to the message.</remarks>
-        public Message AddFloat(float value) => Add(value);
-
         /// <summary>Adds a <see cref="float"/> to the message.</summary>
         /// <param name="value">The <see cref="float"/> to add.</param>
         /// <returns>The message that the <see cref="float"/> was added to.</returns>
-        public Message Add(float value)
+        public Message AddFloat(float value)
         {
-            if (UnwrittenLength < RiptideConverter.FloatLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'float'!");
+            if (UnwrittenLength < sizeof(float))
+                throw new InsufficientCapacityException(this, FloatName, sizeof(float));
 
-            RiptideConverter.FromFloat(value, Bytes, writePos);
-            writePos += RiptideConverter.FloatLength;
+            Converter.FromFloat(value, Bytes, writePos);
+            writePos += sizeof(float);
             return this;
         }
 
@@ -1273,74 +1053,41 @@ namespace RiptideNetworking
         /// <returns>The <see cref="float"/> that was retrieved.</returns>
         public float GetFloat()
         {
-            if (UnreadLength < RiptideConverter.FloatLength)
+            if (UnreadLength < sizeof(float))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'float', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(FloatName));
                 return 0;
             }
 
-            float value = RiptideConverter.ToFloat(Bytes, readPos);
-            readPos += RiptideConverter.FloatLength;
+            float value = Converter.ToFloat(Bytes, readPos);
+            readPos += sizeof(float);
             return value;
         }
 
-        /// <inheritdoc cref="Add(float[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(float[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="float"/> array to the message.</remarks>
-        public Message AddFloats(float[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
         /// <summary>Adds a <see cref="float"/> array to the message.</summary>
-        /// <param name="array">The <see cref="float"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="float"/> array was added to.</returns>
-        public Message Add(float[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddFloats(float[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetFloats to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.FloatLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'float[]'!");
+            if (UnwrittenLength < array.Length * sizeof(float))
+                throw new InsufficientCapacityException(this, array.Length, FloatName, sizeof(float));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddFloat(array[i]);
 
             return this;
         }
 
         /// <summary>Retrieves a <see cref="float"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="float"/> array that was retrieved.</returns>
-        public float[] GetFloats(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetFloats(GetUShort());
-            else
-                return GetFloats(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public float[] GetFloats() => GetFloats(GetArrayLength());
         /// <summary>Retrieves a <see cref="float"/> array from the message.</summary>
         /// <param name="amount">The amount of floats to retrieve.</param>
-        /// <returns>The <see cref="float"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public float[] GetFloats(int amount)
         {
             float[] array = new float[amount];
@@ -1349,51 +1096,47 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="float"/> array with floats retrieved from the message.</summary>
         /// <param name="amount">The amount of floats to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetFloats(int amount, float[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetFloats(int amount, float[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} floats, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, FloatName));
 
-            ReadFloats(amount, array, startIndex);
+            ReadFloats(amount, intoArray, startIndex);
         }
 
         /// <summary>Reads a number of floats from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of floats to read.</param>
-        /// <param name="array">The array to write the floats into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadFloats(int amount, float[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the floats into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadFloats(int amount, float[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.FloatLength)
+            if (UnreadLength < amount * sizeof(float))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'float[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.FloatLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, FloatName));
+                amount = UnreadLength / sizeof(float);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToFloat(Bytes, readPos);
-                readPos += RiptideConverter.FloatLength;
+                intoArray[startIndex + i] = Converter.ToFloat(Bytes, readPos);
+                readPos += sizeof(float);
             }
         }
         #endregion
 
         #region Double
-        /// <inheritdoc cref="Add(double)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(double)"/> and simply provides an alternative type-explicit way to add a <see cref="double"/> to the message.</remarks>
-        public Message AddDouble(double value) => Add(value);
-
         /// <summary>Adds a <see cref="double"/> to the message.</summary>
         /// <param name="value">The <see cref="double"/> to add.</param>
         /// <returns>The message that the <see cref="double"/> was added to.</returns>
-        public Message Add(double value)
+        public Message AddDouble(double value)
         {
-            if (UnwrittenLength < RiptideConverter.DoubleLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'double'!");
+            if (UnwrittenLength < sizeof(double))
+                throw new InsufficientCapacityException(this, DoubleName, sizeof(double));
 
-            RiptideConverter.FromDouble(value, Bytes, writePos);
-            writePos += RiptideConverter.DoubleLength;
+            Converter.FromDouble(value, Bytes, writePos);
+            writePos += sizeof(double);
             return this;
         }
 
@@ -1401,74 +1144,41 @@ namespace RiptideNetworking
         /// <returns>The <see cref="double"/> that was retrieved.</returns>
         public double GetDouble()
         {
-            if (UnreadLength < RiptideConverter.DoubleLength)
+            if (UnreadLength < sizeof(double))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'double', returning 0!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(DoubleName));
                 return 0;
             }
 
-            double value = RiptideConverter.ToDouble(Bytes, readPos);
-            readPos += RiptideConverter.DoubleLength;
+            double value = Converter.ToDouble(Bytes, readPos);
+            readPos += sizeof(double);
             return value;
         }
 
-        /// <inheritdoc cref="Add(double[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(double[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="double"/> array to the message.</remarks>
-        public Message AddDoubles(double[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
         /// <summary>Adds a <see cref="double"/> array to the message.</summary>
-        /// <param name="array">The <see cref="double"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="double"/> array was added to.</returns>
-        public Message Add(double[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddDoubles(double[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetDoubles to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
 
-            if (UnwrittenLength < array.Length * RiptideConverter.DoubleLength)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'double[]'!");
+            if (UnwrittenLength < array.Length * sizeof(double))
+                throw new InsufficientCapacityException(this, array.Length, DoubleName, sizeof(double));
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddDouble(array[i]);
 
             return this;
         }
 
-        /// <summary>Retrieves a<see cref="double"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="double"/> array that was retrieved.</returns>
-        public double[] GetDoubles(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetDoubles(GetUShort());
-            else
-                return GetDoubles(GetByte());
-        }
-        /// <summary>Retrieves a<see cref="double"/> array from the message.</summary>
+        /// <summary>Retrieves a <see cref="double"/> array from the message.</summary>
+        /// <returns>The array that was retrieved.</returns>
+        public double[] GetDoubles() => GetDoubles(GetArrayLength());
+        /// <summary>Retrieves a <see cref="double"/> array from the message.</summary>
         /// <param name="amount">The amount of doubles to retrieve.</param>
-        /// <returns>The <see cref="double"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public double[] GetDoubles(int amount)
         {
             double[] array = new double[amount];
@@ -1477,53 +1187,48 @@ namespace RiptideNetworking
         }
         /// <summary>Populates a <see cref="double"/> array with doubles retrieved from the message.</summary>
         /// <param name="amount">The amount of doubles to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetDoubles(int amount, double[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetDoubles(int amount, double[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} doubles, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, DoubleName));
 
-            ReadDoubles(amount, array, startIndex);
+            ReadDoubles(amount, intoArray, startIndex);
         }
 
         /// <summary>Reads a number of doubles from the message and writes them into the given array.</summary>
         /// <param name="amount">The amount of doubles to read.</param>
-        /// <param name="array">The array to write the doubles into.</param>
-        /// <param name="startIndex">The position at which to start writing into <paramref name="array"/>.</param>
-        private void ReadDoubles(int amount, double[] array, int startIndex = 0)
+        /// <param name="intoArray">The array to write the doubles into.</param>
+        /// <param name="startIndex">The position at which to start writing into the array.</param>
+        private void ReadDoubles(int amount, double[] intoArray, int startIndex = 0)
         {
-            if (UnreadLength < amount * RiptideConverter.DoubleLength)
+            if (UnreadLength < amount * sizeof(double))
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'double[]', array will contain default elements!");
-                amount = UnreadLength / RiptideConverter.DoubleLength;
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(intoArray.Length, DoubleName));
+                amount = UnreadLength / sizeof(double);
             }
 
             for (int i = 0; i < amount; i++)
             {
-                array[startIndex + i] = RiptideConverter.ToDouble(Bytes, readPos);
-                readPos += RiptideConverter.DoubleLength;
+                intoArray[startIndex + i] = Converter.ToDouble(Bytes, readPos);
+                readPos += sizeof(double);
             }
         }
         #endregion
 
         #region String
-        /// <inheritdoc cref="Add(string)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(string)"/> and simply provides an alternative type-explicit way to add a <see cref="string"/> to the message.</remarks>
-        public Message AddString(string value) => Add(value);
-
         /// <summary>Adds a <see cref="string"/> to the message.</summary>
         /// <param name="value">The <see cref="string"/> to add.</param>
         /// <returns>The message that the <see cref="string"/> was added to.</returns>
-        public Message Add(string value)
+        public Message AddString(string value)
         {
             byte[] stringBytes = Encoding.UTF8.GetBytes(value);
-            Add((ushort)stringBytes.Length); // Add the length of the string (in bytes) to the message
+            int requiredBytes = stringBytes.Length + (stringBytes.Length <= OneByteLengthThreshold ? 1 : 2);
+            if (UnwrittenLength < requiredBytes)
+                throw new InsufficientCapacityException(this, StringName, requiredBytes);
 
-            if (UnwrittenLength < stringBytes.Length)
-                throw new Exception($"Message has insufficient remaining capacity ({UnwrittenLength}) to add type 'string'!");
-
-            Add(stringBytes, false); // Add the string itself
+            AddBytes(stringBytes);
             return this;
         }
 
@@ -1531,10 +1236,10 @@ namespace RiptideNetworking
         /// <returns>The <see cref="string"/> that was retrieved.</returns>
         public string GetString()
         {
-            ushort length = GetUShort(); // Get the length of the string (in bytes, NOT characters)
+            ushort length = GetArrayLength(); // Get the length of the string (in bytes, NOT characters)
             if (UnreadLength < length)
             {
-                RiptideLogger.Log(LogType.error, $"Message contains insufficient unread bytes ({UnreadLength}) to read type 'string', result will be truncated!");
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(StringName, "shortened string"));
                 length = (ushort)UnreadLength;
             }
             
@@ -1543,60 +1248,32 @@ namespace RiptideNetworking
             return value;
         }
 
-        /// <inheritdoc cref="Add(string[], bool, bool)"/>
-        /// <remarks>Relying on the correct Add overload being chosen based on the parameter type can increase the odds of accidental type mismatches when retrieving data from a message. This method calls <see cref="Add(string[], bool, bool)"/> and simply provides an alternative type-explicit way to add a <see cref="string"/> array to the message.</remarks>
-        public Message AddStrings(string[] value, bool includeLength = true, bool isBigArray = false) => Add(value, includeLength, isBigArray);
-
         /// <summary>Adds a <see cref="string"/> array to the message.</summary>
-        /// <param name="array">The <see cref="string"/> array to add.</param>
+        /// <param name="array">The array to add.</param>
         /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being added has more than 255 elements. Does nothing if <paramref name="includeLength"/> is set to <see langword="false"/>.
-        ///   <para>
-        ///     Writes the length using 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Writes the length using 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The message that the <see cref="string"/> array was added to.</returns>
-        public Message Add(string[] array, bool includeLength = true, bool isBigArray = false)
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddStrings(string[] array, bool includeLength = true)
         {
             if (includeLength)
-            {
-                if (isBigArray)
-                    Add((ushort)array.Length);
-                else
-                {
-                    if (array.Length > byte.MaxValue)
-                        throw new Exception($"Array is too long for the length to be stored in a single byte! Set isBigArray to true when calling Add & GetStrings to store the length in 2 bytes instead.");
-                    Add((byte)array.Length);
-                }
-            }
+                AddArrayLength(array.Length);
+
+            // It'd be ideal to throw an exception here (instead of in AddString) if the entire array isn't going to fit, but since each string could
+            // be (and most likely is) a different length and some characters use more than a single byte, the only way of doing that would be to loop
+            // through the whole array here and convert each string to bytes ahead of time, just to get the required byte count. Then if they all fit
+            // into the message, they would all be converted again when actually being written into the byte array, which is obviously inefficient.
 
             for (int i = 0; i < array.Length; i++)
-                Add(array[i]);
+                AddString(array[i]);
 
             return this;
         }
 
         /// <summary>Retrieves a <see cref="string"/> array from the message.</summary>
-        /// <param name="isBigArray">
-        ///   Whether or not the array being retrieved has more than 255 elements.
-        ///   <para>
-        ///     Reads the length from 2 bytes (<see cref="ushort"/>) if <see langword="true"/>.<br/>
-        ///     Reads the length from 1 <see cref="byte"/> if <see langword="false"/>.
-        ///   </para>
-        /// </param>
-        /// <returns>The <see cref="string"/> array that was retrieved.</returns>
-        public string[] GetStrings(bool isBigArray = false)
-        {
-            if (isBigArray)
-                return GetStrings(GetUShort());
-            else
-                return GetStrings(GetByte());
-        }
+        /// <returns>The array that was retrieved.</returns>
+        public string[] GetStrings() => GetStrings(GetArrayLength());
         /// <summary>Retrieves a <see cref="string"/> array from the message.</summary>
         /// <param name="amount">The amount of strings to retrieve.</param>
-        /// <returns>The <see cref="string"/> array that was retrieved.</returns>
+        /// <returns>The array that was retrieved.</returns>
         public string[] GetStrings(int amount)
         {
             string[] array = new string[amount];
@@ -1606,18 +1283,284 @@ namespace RiptideNetworking
             return array;
         }
         /// <summary>Populates a <see cref="string"/> array with strings retrieved from the message.</summary>
-        /// <param name="amount">The amount of string to retrieve.</param>
-        /// <param name="array">The array to populate.</param>
-        /// <param name="startIndex">The position at which to start populating <paramref name="array"/>.</param>
-        public void GetStrings(int amount, string[] array, int startIndex = 0)
+        /// <param name="amount">The amount of strings to retrieve.</param>
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetStrings(int amount, string[] intoArray, int startIndex = 0)
         {
-            if (startIndex + amount > array.Length)
-                throw new ArgumentOutOfRangeException($"Destination array isn't long enough to fit {amount} strings, starting at index {startIndex}!");
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, StringName));
 
             for (int i = 0; i < amount; i++)
-                array[startIndex + i] = GetString();
+                intoArray[startIndex + i] = GetString();
         }
         #endregion
+
+        #region Array Lengths
+        /// <summary>The maximum number of elements an array can contain where the length still fits into a single byte.</summary>
+        private const int OneByteLengthThreshold = 0b_0111_1111;
+        /// <summary>The maximum number of elements an array can contain where the length still fits into two byte2.</summary>
+        private const int TwoByteLengthThreshold = 0b_0111_1111_1111_1111;
+
+        /// <summary>Adds the length of an array to the message, using either 1 or 2 bytes depending on how large the array is. Does not support arrays with more than 32,767 elements.</summary>
+        /// <param name="length">The length of the array.</param>
+        private void AddArrayLength(int length)
+        {
+            if (UnwrittenLength < 1)
+                throw new InsufficientCapacityException(this, ArrayLengthName, length <= OneByteLengthThreshold ? 1 : 2);
+
+            if (length <= OneByteLengthThreshold)
+                Bytes[writePos++] = (byte)length;
+            else
+            {
+                if (length > TwoByteLengthThreshold)
+                    throw new ArgumentOutOfRangeException(nameof(length), $"Messages do not support auto-inclusion of array lengths for arrays with more than {TwoByteLengthThreshold} elements! Either send a smaller array or set the 'includeLength' paremeter to false in the Add method and manually pass the array length to the Get method.");
+                
+                if (UnwrittenLength < 2)
+                    throw new InsufficientCapacityException(this, ArrayLengthName, 2);
+
+                length |= 0b_1000_0000_0000_0000;
+                Bytes[writePos++] = (byte)(length >> 8); // Add the byte with the big array flag bit first, using AddUShort would add it second
+                Bytes[writePos++] = (byte)length;
+            }
+        }
+
+        /// <summary>Retrieves the length of an array from the message, using either 1 or 2 bytes depending on how large the array is.</summary>
+        /// <returns>The length of the array.</returns>
+        private ushort GetArrayLength()
+        {
+            if (UnreadLength < 1)
+            {
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(ArrayLengthName));
+                return 0;
+            }
+
+            if ((Bytes[readPos] & 0b_1000_0000) == 0)
+                return GetByte();
+            
+            if (UnreadLength < 2)
+            {
+                RiptideLogger.Log(LogType.Error, NotEnoughBytesError(ArrayLengthName));
+                return 0;
+            }
+            
+            return (ushort)(((Bytes[readPos++] << 8) | Bytes[readPos++]) & 0b_0111_1111_1111_1111); // Read the byte with the big array flag bit first, using GetUShort would add it second
+        }
+        #endregion
+
+        #region IMessageSerializable Types
+        /// <summary>Adds a serializable to the message.</summary>
+        /// <param name="value">The serializable to add.</param>
+        /// <returns>The message that the serializable was added to.</returns>
+        public Message AddSerializable<T>(T value) where T : IMessageSerializable
+        {
+            value.Serialize(this);
+            return this;
+        }
+
+        /// <summary>Retrieves a serializable from the message.</summary>
+        /// <returns>The serializable that was retrieved.</returns>
+        public T GetSerializable<T>() where T : IMessageSerializable, new()
+        {
+            T t = new T();
+            t.Deserialize(this);
+            return t;
+        }
+
+        /// <summary>Adds an array of serializables to the message.</summary>
+        /// <param name="array">The array to add.</param>
+        /// <param name="includeLength">Whether or not to include the length of the array in the message.</param>
+        /// <returns>The message that the array was added to.</returns>
+        public Message AddSerializables<T>(T[] array, bool includeLength = true) where T : IMessageSerializable
+        {
+            if (includeLength)
+                AddArrayLength(array.Length);
+
+            for (int i = 0; i < array.Length; i++)
+                AddSerializable(array[i]);
+
+            return this;
+        }
+
+        /// <summary>Retrieves an array of serializables from the message.</summary>
+        /// <returns>The array that was retrieved.</returns>
+        public T[] GetSerializables<T>() where T : IMessageSerializable, new() => GetSerializables<T>(GetArrayLength());
+        /// <summary>Retrieves an array of serializables from the message.</summary>
+        /// <param name="amount">The amount of serializables to retrieve.</param>
+        /// <returns>The array that was retrieved.</returns>
+        public T[] GetSerializables<T>(int amount) where T : IMessageSerializable, new()
+        {
+            T[] array = new T[amount];
+            ReadSerializables(amount, array);
+            return array;
+        }
+        /// <summary>Populates an array of serializables retrieved from the message.</summary>
+        /// <param name="amount">The amount of serializables to retrieve.</param>
+        /// <param name="intoArray">The array to populate.</param>
+        /// <param name="startIndex">The position at which to start populating the array.</param>
+        public void GetSerializables<T>(int amount, T[] intoArray, int startIndex = 0) where T : IMessageSerializable, new()
+        {
+            if (startIndex + amount > intoArray.Length)
+                throw new ArgumentException(nameof(amount), ArrayNotLongEnoughError(amount, intoArray.Length, startIndex, typeof(T).Name));
+
+            ReadSerializables(amount, intoArray, startIndex);
+        }
+
+        /// <summary>Reads a number of serializables from the message and writes them into the given array.</summary>
+        /// <param name="amount">The amount of serializables to read.</param>
+        /// <param name="intArray">The array to write the serializables into.</param>
+        /// <param name="startIndex">The position at which to start writing into <paramref name="intArray"/>.</param>
+        private void ReadSerializables<T>(int amount, T[] intArray, int startIndex = 0) where T : IMessageSerializable, new()
+        {
+            for (int i = 0; i < amount; i++)
+            {
+                intArray[startIndex + i] = GetSerializable<T>();
+            }
+        }
+        #endregion
+
+        #region Overload Versions
+        /// <inheritdoc cref="AddByte(byte)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddByte(byte)"/>.</remarks>
+        public Message Add(byte value) => AddByte(value);
+        /// <inheritdoc cref="AddSByte(sbyte)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddSByte(sbyte)"/>.</remarks>
+        public Message Add(sbyte value) => AddSByte(value);
+        /// <inheritdoc cref="AddBool(bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddBool(bool)"/>.</remarks>
+        public Message Add(bool value) => AddBool(value);
+        /// <inheritdoc cref="AddShort(short)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddShort(short)"/>.</remarks>
+        public Message Add(short value) => AddShort(value);
+        /// <inheritdoc cref="AddUShort(ushort)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddUShort(ushort)"/>.</remarks>
+        public Message Add(ushort value) => AddUShort(value);
+        /// <inheritdoc cref="AddInt(int)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddInt(int)"/>.</remarks>
+        public Message Add(int value) => AddInt(value);
+        /// <inheritdoc cref="AddUInt(uint)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddUInt(uint)"/>.</remarks>
+        public Message Add(uint value) => AddUInt(value);
+        /// <inheritdoc cref="AddLong(long)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddLong(long)"/>.</remarks>
+        public Message Add(long value) => AddLong(value);
+        /// <inheritdoc cref="AddULong(ulong)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddULong(ulong)"/>.</remarks>
+        public Message Add(ulong value) => AddULong(value);
+        /// <inheritdoc cref="AddFloat(float)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddFloat(float)"/>.</remarks>
+        public Message Add(float value) => AddFloat(value);
+        /// <inheritdoc cref="AddDouble(double)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddDouble(double)"/>.</remarks>
+        public Message Add(double value) => AddDouble(value);
+        /// <inheritdoc cref="AddString(string)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddString(string)"/>.</remarks>
+        public Message Add(string value) => AddString(value);
+        /// <inheritdoc cref="AddSerializable{T}(T)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddSerializable{T}(T)"/>.</remarks>
+        public Message Add<T>(T value) where T : IMessageSerializable => AddSerializable(value);
+
+        /// <inheritdoc cref="AddBytes(byte[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddBytes(byte[], bool)"/>.</remarks>
+        public Message Add(byte[] array, bool includeLength = true) => AddBytes(array, includeLength);
+        /// <inheritdoc cref="AddSBytes(sbyte[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddSBytes(sbyte[], bool)"/>.</remarks>
+        public Message Add(sbyte[] array, bool includeLength = true) => AddSBytes(array, includeLength);
+        /// <inheritdoc cref="AddBools(bool[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddBools(bool[], bool)"/>.</remarks>
+        public Message Add(bool[] array, bool includeLength = true) => AddBools(array, includeLength);
+        /// <inheritdoc cref="AddShorts(short[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddShorts(short[], bool)"/>.</remarks>
+        public Message Add(short[] array, bool includeLength = true) => AddShorts(array, includeLength);
+        /// <inheritdoc cref="AddUShorts(ushort[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddUShorts(ushort[], bool)"/>.</remarks>
+        public Message Add(ushort[] array, bool includeLength = true) => AddUShorts(array, includeLength);
+        /// <inheritdoc cref="AddInts(int[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddInts(int[], bool)"/>.</remarks>
+        public Message Add(int[] array, bool includeLength = true) => AddInts(array, includeLength);
+        /// <inheritdoc cref="AddUInts(uint[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddUInts(uint[], bool)"/>.</remarks>
+        public Message Add(uint[] array, bool includeLength = true) => AddUInts(array, includeLength);
+        /// <inheritdoc cref="AddLongs(long[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddLongs(long[], bool)"/>.</remarks>
+        public Message Add(long[] array, bool includeLength = true) => AddLongs(array, includeLength);
+        /// <inheritdoc cref="AddULongs(ulong[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddULongs(ulong[], bool)"/>.</remarks>
+        public Message Add(ulong[] array, bool includeLength = true) => AddULongs(array, includeLength);
+        /// <inheritdoc cref="AddFloats(float[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddFloats(float[], bool)"/>.</remarks>
+        public Message Add(float[] array, bool includeLength = true) => AddFloats(array, includeLength);
+        /// <inheritdoc cref="AddDoubles(double[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddDoubles(double[], bool)"/>.</remarks>
+        public Message Add(double[] array, bool includeLength = true) => AddDoubles(array, includeLength);
+        /// <inheritdoc cref="AddStrings(string[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddStrings(string[], bool)"/>.</remarks>
+        public Message Add(string[] array, bool includeLength = true) => AddStrings(array, includeLength);
+        /// <inheritdoc cref="AddSerializables{T}(T[], bool)"/>
+        /// <remarks>This method is simply an alternative way of calling <see cref="AddSerializables{T}(T[], bool)"/>.</remarks>
+        public Message Add<T>(T[] array, bool includeLength = true) where T : IMessageSerializable, new() => AddSerializables(array, includeLength);
+        #endregion
+        #endregion
+
+        #region Error Messaging
+        /// <summary>The name of a <see cref="byte"/> value.</summary>
+        private const string ByteName        = "byte";
+        /// <summary>The name of a <see cref="sbyte"/> value.</summary>
+        private const string SByteName       = "sbyte";
+        /// <summary>The name of a <see cref="bool"/> value.</summary>
+        private const string BoolName        = "bool";
+        /// <summary>The name of a <see cref="short"/> value.</summary>
+        private const string ShortName       = "short";
+        /// <summary>The name of a <see cref="ushort"/> value.</summary>
+        private const string UShortName      = "ushort";
+        /// <summary>The name of an <see cref="int"/> value.</summary>
+        private const string IntName         = "int";
+        /// <summary>The name of a <see cref="uint"/> value.</summary>
+        private const string UIntName        = "uint";
+        /// <summary>The name of a <see cref="long"/> value.</summary>
+        private const string LongName        = "long";
+        /// <summary>The name of a <see cref="ulong"/> value.</summary>
+        private const string ULongName       = "ulong";
+        /// <summary>The name of a <see cref="float"/> value.</summary>
+        private const string FloatName       = "float";
+        /// <summary>The name of a <see cref="double"/> value.</summary>
+        private const string DoubleName      = "double";
+        /// <summary>The name of a <see cref="string"/> value.</summary>
+        private const string StringName      = "string";
+        /// <summary>The name of an array length value.</summary>
+        private const string ArrayLengthName = "array length";
+
+        /// <summary>Constructs an error message for when a message contains insufficient unread bytes to retrieve a certain value.</summary>
+        /// <param name="valueName">The name of the value type for which the retrieval attempt failed.</param>
+        /// <param name="defaultReturn">Text describing the value which will be returned.</param>
+        /// <returns>The error message.</returns>
+        private string NotEnoughBytesError(string valueName, string defaultReturn = "0")
+        {
+            return $"Message only contains {UnreadLength} unread {Helper.CorrectForm(UnreadLength, "byte")}, which is not enough to retrieve a value of type '{valueName}'! Returning {defaultReturn}.";
+        }
+        /// <summary>Constructs an error message for when a message contains insufficient unread bytes to retrieve an array of values.</summary>
+        /// <param name="arrayLength">The expected length of the array.</param>
+        /// <param name="valueName">The name of the value type for which the retrieval attempt failed.</param>
+        /// <returns>The error message.</returns>
+        private string NotEnoughBytesError(int arrayLength, string valueName)
+        {
+            return $"Message only contains {UnreadLength} unread {Helper.CorrectForm(UnreadLength, "byte")}, which is not enough to retrieve {arrayLength} {Helper.CorrectForm(arrayLength, valueName)}! Returned array will contain default elements.";
+        }
+
+        /// <summary>Constructs an error message for when a number of retrieved values do not fit inside the bounds of the provided array.</summary>
+        /// <param name="amount">The number of values being retrieved.</param>
+        /// <param name="arrayLength">The length of the provided array.</param>
+        /// <param name="startIndex">The position in the array at which to begin writing values.</param>
+        /// <param name="valueName">The name of the value type which is being retrieved.</param>
+        /// <param name="pluralValueName">The name of the value type in plural form. If left empty, this will be set to <paramref name="valueName"/> with an <c>s</c> appended to it.</param>
+        /// <returns>The error message.</returns>
+        private string ArrayNotLongEnoughError(int amount, int arrayLength, int startIndex, string valueName, string pluralValueName = "")
+        {
+            if (string.IsNullOrEmpty(pluralValueName))
+                pluralValueName = $"{valueName}s";
+
+            return $"The amount of {pluralValueName} to retrieve ({amount}) is greater than the number of elements from the start index ({startIndex}) to the end of the given array (length: {arrayLength})!";
+        }
         #endregion
     }
 }

@@ -1,13 +1,7 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2021 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
-
-using RiptideNetworking;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 
-namespace RiptideDemos.RudpTransport.Unity.ExampleServer
+namespace Riptide.Demos.DedicatedServer
 {
     [RequireComponent(typeof(CharacterController))]
     public class Player : MonoBehaviour
@@ -104,38 +98,38 @@ namespace RiptideDemos.RudpTransport.Unity.ExampleServer
         /// <param name="toClient">The client to send the message to.</param>
         public void SendSpawn(ushort toClient)
         {
-            NetworkManager.Singleton.Server.Send(GetSpawnData(Message.Create(MessageSendMode.reliable, ServerToClientId.spawnPlayer)), toClient);
+            NetworkManager.Singleton.Server.Send(GetSpawnData(Message.Create(MessageSendMode.Reliable, ServerToClientId.SpawnPlayer)), toClient);
         }
         /// <summary>Sends a player's info to all clients.</summary>
         private void SendSpawn()
         {
-            NetworkManager.Singleton.Server.SendToAll(GetSpawnData(Message.Create(MessageSendMode.reliable, ServerToClientId.spawnPlayer)));
+            NetworkManager.Singleton.Server.SendToAll(GetSpawnData(Message.Create(MessageSendMode.Reliable, ServerToClientId.SpawnPlayer)));
         }
 
         private Message GetSpawnData(Message message)
         {
-            message.Add(Id);
-            message.Add(Username);
-            message.Add(transform.position);
+            message.AddUShort(Id);
+            message.AddString(Username);
+            message.AddVector3(transform.position);
             return message;
         }
 
         private void SendMovement()
         {
-            Message message = Message.Create(MessageSendMode.unreliable, ServerToClientId.playerMovement);
-            message.Add(Id);
-            message.Add(transform.position);
-            message.Add(transform.forward);
+            Message message = Message.Create(MessageSendMode.Unreliable, ServerToClientId.PlayerMovement);
+            message.AddUShort(Id);
+            message.AddVector3(transform.position);
+            message.AddVector3(transform.forward);
             NetworkManager.Singleton.Server.SendToAll(message);
         }
 
-        [MessageHandler((ushort)ClientToServerId.playerName)]
+        [MessageHandler((ushort)ClientToServerId.PlayerName)]
         private static void PlayerName(ushort fromClientId, Message message)
         {
             Spawn(fromClientId, message.GetString());
         }
 
-        [MessageHandler((ushort)ClientToServerId.playerInput)]
+        [MessageHandler((ushort)ClientToServerId.PlayerInput)]
         private static void PlayerInput(ushort fromClientId, Message message)
         {
             Player player = List[fromClientId];

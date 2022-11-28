@@ -1,13 +1,7 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2021 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
-
-using RiptideNetworking;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 
-namespace RiptideDemos.RudpTransport.Unity.ExampleClient
+namespace Riptide.Demos.DedicatedClient
 {
     public class Player : MonoBehaviour
     {
@@ -44,13 +38,13 @@ namespace RiptideDemos.RudpTransport.Unity.ExampleClient
         }
 
         #region Messages
-        [MessageHandler((ushort)ServerToClientId.spawnPlayer)]
+        [MessageHandler((ushort)ServerToClientId.SpawnPlayer)]
         private static void SpawnPlayer(Message message)
         {
             Spawn(message.GetUShort(), message.GetString(), message.GetVector3());
         }
 
-        [MessageHandler((ushort)ServerToClientId.playerMovement)]
+        [MessageHandler((ushort)ServerToClientId.PlayerMovement)]
         private static void PlayerMovement(Message message)
         {
             ushort playerId = message.GetUShort();

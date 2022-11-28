@@ -1,14 +1,8 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2022 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
-
-using Microsoft.Xna.Framework;
-using RiptideDemos.RudpTransport.MonoGame.Common;
-using RiptideNetworking;
+﻿using Microsoft.Xna.Framework;
+using Riptide.Demos.MGCommon;
 using System.Collections.Generic;
 
-namespace RiptideDemos.RudpTransport.MonoGame.TestServer
+namespace Riptide.Demos.MGServer
 {
     internal class Player
     {
@@ -36,15 +30,15 @@ namespace RiptideDemos.RudpTransport.MonoGame.TestServer
 
         private Message CreateSpawnMessage()
         {
-            Message message = Message.Create(MessageSendMode.reliable, MessageId.PlayerSpawn);
-            message.Add(id);
-            message.Add(position);
+            Message message = Message.Create(MessageSendMode.Reliable, MessageId.PlayerSpawn);
+            message.AddUShort(id);
+            message.AddVector2(position);
             return message;
         }
 
         internal void SendPosition()
         {
-            Message message = Message.Create(MessageSendMode.unreliable, MessageId.PlayerPosition);
+            Message message = Message.Create(MessageSendMode.Unreliable, MessageId.PlayerPosition);
             message.AddUShort(id);
             message.AddVector2(position);
             Program.Server.SendToAll(message, id);

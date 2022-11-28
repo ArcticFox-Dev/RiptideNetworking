@@ -1,16 +1,10 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2022 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
-
-using Microsoft.Xna.Framework;
+﻿using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
-using RiptideDemos.RudpTransport.MonoGame.Common;
-using RiptideNetworking;
+using Riptide.Demos.MGCommon;
 using System.Collections.Generic;
 
-namespace RiptideDemos.RudpTransport.MonoGame.TestClient
+namespace Riptide.Demos.MGClient
 {
     internal class Player
     {
@@ -47,7 +41,7 @@ namespace RiptideDemos.RudpTransport.MonoGame.TestClient
 
         private void SendPosition()
         {
-            Message message = Message.Create(MessageSendMode.unreliable, MessageId.PlayerPosition);
+            Message message = Message.Create(MessageSendMode.Unreliable, MessageId.PlayerPosition);
             message.AddVector2(position);
 
             NetworkManager.Client.Send(message);

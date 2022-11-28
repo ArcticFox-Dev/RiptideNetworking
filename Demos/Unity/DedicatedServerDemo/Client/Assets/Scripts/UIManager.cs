@@ -1,13 +1,7 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2021 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
-
-using RiptideNetworking;
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.UI;
 
-namespace RiptideDemos.RudpTransport.Unity.ExampleClient
+namespace Riptide.Demos.DedicatedClient
 {
     public class UIManager : MonoBehaviour
     {
@@ -52,8 +46,8 @@ namespace RiptideDemos.RudpTransport.Unity.ExampleClient
         #region Messages
         public void SendName()
         {
-            Message message = Message.Create(MessageSendMode.reliable, ClientToServerId.playerName);
-            message.Add(usernameField.text);
+            Message message = Message.Create(MessageSendMode.Reliable, ClientToServerId.PlayerName);
+            message.AddString(usernameField.text);
             NetworkManager.Singleton.Client.Send(message);
         }
         #endregion

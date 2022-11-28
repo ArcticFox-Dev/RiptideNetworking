@@ -1,12 +1,6 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2022 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
+﻿using UnityEngine;
 
-using RiptideNetworking;
-using UnityEngine;
-
-namespace RiptideDemos.RudpTransport.Unity.PlayerHosted
+namespace Riptide.Demos.PlayerHosted
 {
     [RequireComponent(typeof(CharacterController))]
     public class PlayerController : MonoBehaviour
@@ -100,7 +94,7 @@ namespace RiptideDemos.RudpTransport.Unity.PlayerHosted
         #region Messages
         private void SendMovement()
         {
-            Message message = Message.Create(MessageSendMode.unreliable, MessageId.playerMovement, shouldAutoRelay: true);
+            Message message = Message.Create(MessageSendMode.Unreliable, MessageId.PlayerMovement);
             message.AddUShort(player.Id);
             message.AddVector3(transform.position);
             message.AddVector3(transform.forward);

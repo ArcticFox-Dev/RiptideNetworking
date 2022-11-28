@@ -1,87 +1,111 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2021 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
+﻿// This file is provided under The MIT License as part of RiptideNetworking.
+// Copyright (c) Tom Weiland
+// For additional information please see the included LICENSE.md file or view it on GitHub:
+// https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
 
-using RiptideNetworking.Transports;
 using System;
 
-namespace RiptideNetworking
+namespace Riptide
 {
     /// <summary>Contains event data for when a client connects to the server.</summary>
-    public class ServerClientConnectedEventArgs : EventArgs
+    public class ServerConnectedEventArgs : EventArgs
     {
         /// <summary>The newly connected client.</summary>
-        public IConnectionInfo Client { get; private set; }
-        /// <summary>A message containing any custom data the client included when it connected.</summary>
-        public Message ConnectMessage { get; private set; }
+        public readonly Connection Client;
 
         /// <summary>Initializes event data.</summary>
         /// <param name="client">The newly connected client.</param>
-        /// <param name="connectMessage">A message containing any custom data the client included when it connected.</param>
-        public ServerClientConnectedEventArgs(IConnectionInfo client, Message connectMessage)
+        public ServerConnectedEventArgs(Connection client)
         {
             Client = client;
-            ConnectMessage = connectMessage;
-        }
-    }
-
-    /// <summary>Contains event data for when the server receives a message from a client.</summary>
-    public class ServerMessageReceivedEventArgs : EventArgs
-    {
-        /// <summary>The client that the message was received from.</summary>
-        public ushort FromClientId { get; private set; }
-        /// <summary>The ID of the message.</summary>
-        public ushort MessageId { get; private set; }
-        /// <summary>The message that was received.</summary>
-        public Message Message { get; private set; }
-
-        /// <summary>Initializes event data.</summary>
-        /// <param name="fromClientId">The client that the message was received from.</param>
-        /// <param name="messageId">The ID of the message.</param>
-        /// <param name="message">The message that was received.</param>
-        public ServerMessageReceivedEventArgs(ushort fromClientId, ushort messageId, Message message)
-        {
-            FromClientId = fromClientId;
-            MessageId = messageId;
-            Message = message;
-        }
-    }
-
-    /// <summary>Contains event data for when a new client connects.</summary>
-    public class ClientConnectedEventArgs : EventArgs
-    {
-        /// <summary>The numeric ID of the newly connected client.</summary>
-        public ushort Id { get; private set; }
-
-        /// <summary>Initializes event data.</summary>
-        /// <param name="id">The numeric ID of the newly connected client.</param>
-        public ClientConnectedEventArgs(ushort id) => Id = id;
-    }
-
-    /// <summary>Contains event data for when the client receives a message from the server.</summary>
-    public class ClientMessageReceivedEventArgs : EventArgs
-    {
-        /// <summary>The ID of the message.</summary>
-        public ushort MessageId { get; private set; }
-        /// <summary>The message that was received.</summary>
-        public Message Message { get; private set; }
-
-        /// <summary>Initializes event data.</summary>
-        /// <param name="messageId">The ID of the message.</param>
-        /// <param name="message">The message that was received.</param>
-        public ClientMessageReceivedEventArgs(ushort messageId, Message message)
-        {
-            MessageId = messageId;
-            Message = message;
         }
     }
 
     /// <summary>Contains event data for when a client disconnects from the server.</summary>
+    public class ServerDisconnectedEventArgs : EventArgs
+    {
+        /// <summary>The client that disconnected.</summary>
+        public readonly Connection Client;
+        /// <summary>The reason for the disconnection.</summary>
+        public readonly DisconnectReason Reason;
+
+        /// <summary>Initializes event data.</summary>
+        /// <param name="client">The client that disconnected.</param>
+        /// <param name="reason">The reason for the disconnection.</param>
+        public ServerDisconnectedEventArgs(Connection client, DisconnectReason reason)
+        {
+            Client = client;
+            Reason = reason;
+        }
+    }
+
+    /// <summary>Contains event data for when a message is received.</summary>
+    public class MessageReceivedEventArgs : EventArgs
+    {
+        /// <summary>The connection from which the message was received.</summary>
+        public readonly Connection FromConnection;
+        /// <summary>The ID of the message.</summary>
+        public readonly ushort MessageId;
+        /// <summary>The received message.</summary>
+        public readonly Message Message;
+
+        /// <summary>Initializes event data.</summary>
+        /// <param name="fromConnection">The connection from which the message was received.</param>
+        /// <param name="messageId">The ID of the message.</param>
+        /// <param name="message">The received message.</param>
+        public MessageReceivedEventArgs(Connection fromConnection, ushort messageId, Message message)
+        {
+            FromConnection = fromConnection;
+            MessageId = messageId;
+            Message = message;
+        }
+    }
+
+    /// <summary>Contains event data for when a connection attempt to a server fails.</summary>
+    public class ConnectionFailedEventArgs : EventArgs
+    {
+        /// <summary>Additional data related to the failed connection attempt (if any).</summary>
+        public readonly Message Message;
+
+        /// <summary>Initializes event data.</summary>
+        /// <param name="message">Additional data related to the failed connection attempt (if any).</param>
+        public ConnectionFailedEventArgs(Message message) => Message = message;
+    }
+
+    /// <summary>Contains event data for when the client disconnects from a server.</summary>
+    public class DisconnectedEventArgs : EventArgs
+    {
+        /// <summary>The reason for the disconnection.</summary>
+        public readonly DisconnectReason Reason;
+        /// <summary>Additional data related to the disconnection (if any).</summary>
+        public readonly Message Message;
+
+        /// <summary>Initializes event data.</summary>
+        /// <param name="reason">The reason for the disconnection.</param>
+        /// <param name="message">Additional data related to the disconnection (if any).</param>
+        public DisconnectedEventArgs(DisconnectReason reason, Message message)
+        {
+            Reason = reason;
+            Message = message;
+        }
+    }
+
+    /// <summary>Contains event data for when a non-local client connects to the server.</summary>
+    public class ClientConnectedEventArgs : EventArgs
+    {
+        /// <summary>The numeric ID of the client that connected.</summary>
+        public readonly ushort Id;
+
+        /// <summary>Initializes event data.</summary>
+        /// <param name="id">The numeric ID of the client that connected.</param>
+        public ClientConnectedEventArgs(ushort id) => Id = id;
+    }
+
+    /// <summary>Contains event data for when a non-local client disconnects from the server.</summary>
     public class ClientDisconnectedEventArgs : EventArgs
     {
         /// <summary>The numeric ID of the client that disconnected.</summary>
-        public ushort Id { get; private set; }
+        public readonly ushort Id;
 
         /// <summary>Initializes event data.</summary>
         /// <param name="id">The numeric ID of the client that disconnected.</param>

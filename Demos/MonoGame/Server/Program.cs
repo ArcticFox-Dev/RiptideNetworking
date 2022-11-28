@@ -1,14 +1,8 @@
-﻿
-// This file is provided under The MIT License as part of RiptideNetworking.
-// Copyright (c) 2022 Tom Weiland
-// For additional information please see the included LICENSE.md file or view it on GitHub: https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
-
-using RiptideNetworking;
-using RiptideNetworking.Utils;
+﻿using Riptide.Utils;
 using System;
 using System.Threading;
 
-namespace RiptideDemos.RudpTransport.MonoGame.TestServer
+namespace Riptide.Demos.MGServer
 {
     internal class Program
     {
@@ -22,11 +16,11 @@ namespace RiptideDemos.RudpTransport.MonoGame.TestServer
             Server.Start(7777, 4);
 
             Server.ClientConnected += (s, e) => new Player(e.Client.Id);
-            Server.ClientDisconnected += (s, e) => Player.List.Remove(e.Id);
+            Server.ClientDisconnected += (s, e) => Player.List.Remove(e.Client.Id);
 
             while (true)
             {
-                Server.Tick();
+                Server.Update();
                 Player.SendPositions();
 
                 Thread.Sleep(10);
