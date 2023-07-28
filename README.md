@@ -14,13 +14,22 @@ It provides functionality for establishing connections and sending data back and
 
 Check out the documentation for [installation instructions](https://riptide.tomweiland.net/manual/overview/installation.html) and a [guide on setting up the basics](https://riptide.tomweiland.net/manual/overview/getting-started.html).
 
-For a video tutorial on how to set up Riptide (using v1.1.0) in your project, see [this video](https://youtu.be/6kWNZOFcFQw). You can use the [upgrade guides](https://riptide.tomweiland.net/manual/updates/guides/updating-to-v2.md) to update your project to newer versions afterwards.
+For a video tutorial on how to set up Riptide (using v1.1.0) in your project, see [this video](https://youtu.be/6kWNZOFcFQw). You can use the [upgrade guides](https://riptide.tomweiland.net/manual/updates/guides/updating-to-v2.html) to update your project to newer versions afterwards.
 
 ## Low-Level Transports
 
 - [UDP Transport](RiptideNetworking/RiptideNetworking/Transports/Udp) (built-in)
 - [TCP Transport](RiptideNetworking/RiptideNetworking/Transports/Tcp) (built-in)
 - [Steam Transport](https://github.com/RiptideNetworking/SteamTransport) (in development)
+
+## Implementations in Other Languages
+
+The following is a list of Riptide implementations in other programming languages. These ports are managed and maintained separately and independently by their respective owners, and are not affiliated with Riptide in any official capacity. As such, they may not function interchangeably with all versions of Riptide or with each other.
+
+However, if you need to use Riptide with/in a language other than C# on one end, these implementations may provide a starting point:
+
+- Python: [Pytide](https://github.com/ebosseck/PytideNetworking/tree/main)
+- Dart/Flutter: [Riptide Dart Port](https://github.com/JayKay135/Riptide-Dart-Port)
 
 ## Contributions
 

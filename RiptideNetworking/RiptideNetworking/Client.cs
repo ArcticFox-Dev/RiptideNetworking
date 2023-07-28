@@ -1,4 +1,4 @@
-﻿// This file is provided under The MIT License as part of RiptideNetworking.
+// This file is provided under The MIT License as part of RiptideNetworking.
 // Copyright (c) Tom Weiland
 // For additional information please see the included LICENSE.md file or view it on GitHub:
 // https://github.com/tom-weiland/RiptideNetworking/blob/main/LICENSE.md
@@ -34,11 +34,13 @@ namespace Riptide
         /// <inheritdoc cref="Connection.SmoothRTT"/>
         /// <remarks>This value is slower to accurately represent lasting changes in latency than <see cref="RTT"/>, but it is less susceptible to changing drastically due to significant—but temporary—jumps in latency.</remarks>
         public short SmoothRTT => connection.SmoothRTT;
-        /// <summary>Whether or not the client is currently <i>not</i> connected nor trying to connect.</summary>
+        /// <summary>Sets the client's <see cref="Connection.TimeoutTime"/>.</summary>
+        public override int TimeoutTime { set => connection.TimeoutTime = value; }
+        /// <summary>Whether or not the client is currently <i>not</i> trying to connect, pending, nor actively connected.</summary>
         public bool IsNotConnected => connection is null || connection.IsNotConnected;
         /// <summary>Whether or not the client is currently in the process of connecting.</summary>
         public bool IsConnecting => !(connection is null) && connection.IsConnecting;
-        /// <summary>Whether or not the client's connection is currently pending (will only be <see langword="true"/> when a server doesn't immediately accept the connection request).</summary>
+        /// <summary>Whether or not the client's connection is currently pending (waiting to be accepted/rejected by the server).</summary>
         public bool IsPending => !(connection is null) && connection.IsPending;
         /// <summary>Whether or not the client is currently connected.</summary>
         public bool IsConnected => !(connection is null) && connection.IsConnected;
@@ -81,7 +83,7 @@ namespace Riptide
 
         /// <summary>Disconnects the client if it's connected and swaps out the transport it's using.</summary>
         /// <param name="newTransport">The new transport to use for sending and receiving data.</param>
-        /// <remarks>This method does not automatically reconnect to the server. To continue communicating with the server, <see cref="Connect(string, int, byte, Message)"/> must be called again.</remarks>
+        /// <remarks>This method does not automatically reconnect to the server. To continue communicating with the server, <see cref="Connect(string, int, byte, Message, bool)"/> must be called again.</remarks>
         public void ChangeTransport(IClient newTransport)
         {
             Disconnect();
@@ -93,9 +95,13 @@ namespace Riptide
         /// <param name="maxConnectionAttempts">How many connection attempts to make before giving up.</param>
         /// <param name="messageHandlerGroupId">The ID of the group of message handler methods to use when building <see cref="messageHandlers"/>.</param>
         /// <param name="message">Data that should be sent to the server with the connection attempt. Use <see cref="Message.Create()"/> to get an empty message instance.</param>
-        /// <remarks>Riptide's default transport expects the host address to consist of an IP and port, separated by a colon. For example: <c>127.0.0.1:7777</c>. If you are using a different transport, check the relevant documentation for what information it requires in the host address.</remarks>
+        /// <param name="useMessageHandlers">Whether or not the client should use the built-in message handler system.</param>
+        /// <remarks>
+        ///   <para>Riptide's default transport expects the host address to consist of an IP and port, separated by a colon. For example: <c>127.0.0.1:7777</c>. If you are using a different transport, check the relevant documentation for what information it requires in the host address.</para>
+        ///   <para>Setting <paramref name="useMessageHandlers"/> to <see langword="false"/> will disable the automatic detection and execution of methods with the <see cref="MessageHandlerAttribute"/>, which is beneficial if you prefer to handle messages via the <see cref="MessageReceived"/> event.</para>
+        /// </remarks>
         /// <returns><see langword="true"/> if a connection attempt will be made. <see langword="false"/> if an issue occurred (such as <paramref name="hostAddress"/> being in an invalid format) and a connection attempt will <i>not</i> be made.</returns>
-        public bool Connect(string hostAddress, int maxConnectionAttempts = 5, byte messageHandlerGroupId = 0, Message message = null)
+        public bool Connect(string hostAddress, int maxConnectionAttempts = 5, byte messageHandlerGroupId = 0, Message message = null, bool useMessageHandlers = true)
         {
             Disconnect();
 
@@ -112,7 +118,9 @@ namespace Riptide
             connectionAttempts = 0;
             connection.Peer = this;
             IncreaseActiveCount();
-            CreateMessageHandlersDictionary(messageHandlerGroupId);
+            this.useMessageHandlers = useMessageHandlers;
+            if (useMessageHandlers)
+                CreateMessageHandlersDictionary(messageHandlerGroupId);
 
             if (message != null)
             {
@@ -122,6 +130,7 @@ namespace Riptide
             else
                 connectBytes = null;
 
+            StartTime();
             Heartbeat();
             RiptideLogger.Log(LogType.Info, LogName, $"Connecting to {connection}...");
             return true;
@@ -247,18 +256,12 @@ namespace Riptide
                 case MessageHeader.Ack:
                     connection.HandleAck(message);
                     break;
-                case MessageHeader.AckExtra:
-                    connection.HandleAckExtra(message);
-                    break;
                 case MessageHeader.Connect:
                     connection.SetPending();
                     break;
                 case MessageHeader.Reject:
-                    RejectReason reason = (RejectReason)message.GetByte();
-                    if (reason == RejectReason.Pending)
-                        connection.SetPending();
-                    else if (!IsConnected) // Don't disconnect if we are connected
-                        LocalDisconnect(DisconnectReason.ConnectionRejected, message, reason);
+                    if (!IsConnected) // Don't disconnect if we are connected
+                        LocalDisconnect(DisconnectReason.ConnectionRejected, message, (RejectReason)message.GetByte());
                     break;
                 case MessageHeader.Heartbeat:
                     connection.HandleHeartbeatResponse(message);
@@ -332,10 +335,7 @@ namespace Riptide
         }
 
         /// <summary>What to do when the transport establishes a connection.</summary>
-        private void TransportConnected(object sender, EventArgs e)
-        {
-            StartTime();
-        }
+        private void TransportConnected(object sender, EventArgs e) { }
 
         /// <summary>What to do when the transport fails to connect.</summary>
         private void TransportConnectionFailed(object sender, EventArgs e)
@@ -379,7 +379,7 @@ namespace Riptide
                     reasonString = CRCustom;
                     break;
                 default:
-                    reasonString = UnknownReason;
+                    reasonString = $"{UnknownReason} '{reason}'";
                     break;
             }
             
@@ -394,10 +394,13 @@ namespace Riptide
             ushort messageId = message.GetUShort();
             MessageReceived?.Invoke(this, new MessageReceivedEventArgs(connection, messageId, message));
 
-            if (messageHandlers.TryGetValue(messageId, out MessageHandler messageHandler))
-                messageHandler(message);
-            else
-                RiptideLogger.Log(LogType.Warning, LogName, $"No message handler method found for message ID {messageId}!");
+            if (useMessageHandlers)
+            {
+                if (messageHandlers.TryGetValue(messageId, out MessageHandler messageHandler))
+                    messageHandler(message);
+                else
+                    RiptideLogger.Log(LogType.Warning, LogName, $"No message handler method found for message ID {messageId}!");
+            }
         }
 
         /// <summary>Invokes the <see cref="Disconnected"/> event.</summary>
@@ -427,7 +430,7 @@ namespace Riptide
                     reasonString = DCDisconnected;
                     break;
                 default:
-                    reasonString = UnknownReason;
+                    reasonString = $"{UnknownReason} '{reason}'";
                     break;
             }
 

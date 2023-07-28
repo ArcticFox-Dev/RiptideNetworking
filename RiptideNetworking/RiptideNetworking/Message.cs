@@ -23,9 +23,17 @@ namespace Riptide
     /// <summary>Provides functionality for converting data to bytes and vice versa.</summary>
     public class Message
     {
+        /// <summary>The header size for unreliable messages. Does not count the 2 bytes used for the message ID.</summary>
+        /// <remarks>1 byte - header.</remarks>
+        internal const int UnreliableHeaderSize = 1;
+        /// <summary>The header size for reliable messages. Does not count the 2 bytes used for the message ID.</summary>
+        /// <remarks>1 byte - header, 2 bytes - sequence ID.</remarks>
+        internal const int ReliableHeaderSize = 3;
+        /// <summary>The header size for notify messages.</summary>
+        /// <remarks>1 byte - header, 3 bytes - ack, 2 bytes - sequence ID.</remarks>
+        internal const int NotifyHeaderSize = 6;
         /// <summary>The maximum number of bytes required for a message's header.</summary>
-        /// <remarks>1 byte for the actual header, 2 bytes for the sequence ID (only for reliable messages), 2 bytes for the message ID. Messages sent unreliably will use 2 bytes less than this value for the header.</remarks>
-        public const int MaxHeaderSize = 5;
+        public const int MaxHeaderSize = NotifyHeaderSize;
         /// <summary>The maximum number of bytes that a message can contain, including the <see cref="MaxHeaderSize"/>.</summary>
         public static int MaxSize { get; private set; } = MaxHeaderSize + 1225;
         /// <summary>The maximum number of bytes of payload data that a message can contain. This value represents how many bytes can be added to a message <i>on top of</i> the <see cref="MaxHeaderSize"/>.</summary>
@@ -59,19 +67,21 @@ namespace Riptide
 
         /// <summary>The message's send mode.</summary>
         public MessageSendMode SendMode { get; private set; }
-        /// <summary>The length in bytes of the unread data contained in the message.</summary>
+        /// <summary>How many bytes have been retrieved from the message.</summary>
+        public int ReadLength => readPos;
+        /// <summary>How many more bytes can be retrieved from the message.</summary>
         public int UnreadLength => writePos - readPos;
-        /// <summary>The length in bytes of the data that has been written to the message.</summary>
+        /// <summary>How many bytes have been added to the message.</summary>
         public int WrittenLength => writePos;
-        /// <summary>How many more bytes can be written into the packet.</summary>
-        internal int UnwrittenLength => Bytes.Length - writePos;
+        /// <summary>How many more bytes can be added to the message.</summary>
+        public int UnwrittenLength => Bytes.Length - writePos;
         /// <summary>The message's data.</summary>
         internal byte[] Bytes { get; private set; }
 
         /// <summary>The position in the byte array that the next bytes will be written to.</summary>
-        private ushort writePos = 0;
+        private int writePos;
         /// <summary>The position in the byte array that the next bytes will be read from.</summary>
-        private ushort readPos = 0;
+        private int readPos;
 
         /// <summary>Initializes a reusable <see cref="Message"/> instance.</summary>
         /// <param name="maxSize">The maximum amount of bytes the message can contain.</param>
@@ -99,8 +109,8 @@ namespace Riptide
             }
         }
 
-        /// <summary>Gets a usable message instance.</summary>
-        /// <returns>A message instance ready to be used.</returns>
+        /// <summary>Gets a completely empty message instance with no header.</summary>
+        /// <returns>An empty message instance.</returns>
         public static Message Create()
         {
             return RetrieveFromPool().PrepareForUse();
@@ -108,7 +118,7 @@ namespace Riptide
         /// <summary>Gets a message instance that can be used for sending.</summary>
         /// <param name="sendMode">The mode in which the message should be sent.</param>
         /// <param name="id">The message ID.</param>
-        /// <returns>A message instance ready to be used for sending.</returns>
+        /// <returns>A message instance ready to be sent.</returns>
         public static Message Create(MessageSendMode sendMode, ushort id)
         {
             return RetrieveFromPool().PrepareForUse((MessageHeader)sendMode).AddUShort(id);
@@ -121,18 +131,25 @@ namespace Riptide
         }
         /// <summary>Gets a message instance that can be used for sending.</summary>
         /// <param name="header">The message's header type.</param>
-        /// <returns>A message instance ready to be used for sending.</returns>
+        /// <returns>A message instance ready to be sent.</returns>
         internal static Message Create(MessageHeader header)
         {
             return RetrieveFromPool().PrepareForUse(header);
         }
-
-        /// <summary>Gets a message instance directly from the pool without doing any extra setup.</summary>
-        /// <remarks>As this message instance is returned straight from the pool, it will contain all previous data and settings. Using this instance without preparing it properly will likely result in unexpected behaviour.</remarks>
-        /// <returns>A message instance.</returns>
-        internal static Message CreateRaw()
+        /// <summary>Gets a message instance that can be used for receiving/handling.</summary>
+        /// <param name="header">The message's header type.</param>
+        /// <param name="contentLength">The number of bytes which this message will contain.</param>
+        /// <returns>A message instance ready to be populated with received data.</returns>
+        internal static Message Create(MessageHeader header, int contentLength)
         {
-            return RetrieveFromPool();
+            return RetrieveFromPool().PrepareForUse(header, contentLength);
+        }
+
+        /// <summary>Gets a notify message instance that can be used for sending.</summary>
+        /// <returns>A notify message instance ready to be sent.</returns>
+        public static Message CreateNotify()
+        {
+            return RetrieveFromPool().PrepareForUse(MessageHeader.Notify);
         }
 
         /// <summary>Retrieves a message instance from the pool. If none is available, a new instance is created.</summary>
@@ -182,9 +199,9 @@ namespace Riptide
         }
         /// <summary>Prepares the message to be used for handling.</summary>
         /// <param name="header">The header of the message.</param>
-        /// <param name="contentLength">The number of bytes that this message contains and which can be retrieved.</param>
+        /// <param name="contentLength">The number of bytes that this message will contain and which can be retrieved.</param>
         /// <returns>The message, ready to be used for handling.</returns>
-        internal Message PrepareForUse(MessageHeader header, ushort contentLength)
+        private Message PrepareForUse(MessageHeader header, int contentLength)
         {
             SetHeader(header);
             writePos = contentLength;
@@ -193,19 +210,25 @@ namespace Riptide
 
         /// <summary>Sets the message's header byte to the given <paramref name="header"/> and determines the appropriate <see cref="MessageSendMode"/> and read/write positions.</summary>
         /// <param name="header">The header to use for this message.</param>
-        internal void SetHeader(MessageHeader header)
+        private void SetHeader(MessageHeader header)
         {
             Bytes[0] = (byte)header;
-            if (header >= MessageHeader.Reliable)
+            if (header == MessageHeader.Notify)
             {
-                readPos = 3;
-                writePos = 3;
+                readPos = NotifyHeaderSize;
+                writePos = NotifyHeaderSize;
+                SendMode = MessageSendMode.Unreliable; // Technically it's different but notify messages *are* still unreliable
+            }
+            else if (header >= MessageHeader.Reliable)
+            {
+                readPos = ReliableHeaderSize;
+                writePos = ReliableHeaderSize;
                 SendMode = MessageSendMode.Reliable;
             }
             else
             {
-                readPos = 1;
-                writePos = 1;
+                readPos = UnreliableHeaderSize;
+                writePos = UnreliableHeaderSize;
                 SendMode = MessageSendMode.Unreliable;
             }
         }
@@ -276,7 +299,7 @@ namespace Riptide
                 throw new InsufficientCapacityException(this, array.Length, ByteName, 1);
 
             Array.Copy(array, 0, Bytes, writePos, array.Length);
-            writePos += (ushort)array.Length;
+            writePos += array.Length;
             return this;
         }
 
@@ -359,7 +382,7 @@ namespace Riptide
             }
 
             Array.Copy(Bytes, readPos, intoArray, startIndex, amount); // Copy the bytes at readPos' position to the array that will be returned
-            readPos += (ushort)amount;
+            readPos += amount;
         }
 
         /// <summary>Reads a number of sbytes from the message and writes them into the given array.</summary>
@@ -414,7 +437,7 @@ namespace Riptide
             if (includeLength)
                 AddArrayLength(array.Length);
 
-            ushort byteLength = (ushort)(array.Length / 8 + (array.Length % 8 == 0 ? 0 : 1));
+            int byteLength = array.Length / 8 + (array.Length % 8 == 0 ? 0 : 1);
             if (UnwrittenLength < byteLength)
                 throw new InsufficientCapacityException(this, array.Length, BoolName, sizeof(bool), byteLength);
 
@@ -491,7 +514,7 @@ namespace Riptide
                     intoArray[startIndex + (i * 8 + bit)] = (Bytes[readPos + i] >> bit & 1) == 1;
             }
 
-            readPos += (ushort)byteAmount;
+            readPos += byteAmount;
         }
         #endregion
 
@@ -1236,11 +1259,11 @@ namespace Riptide
         /// <returns>The <see cref="string"/> that was retrieved.</returns>
         public string GetString()
         {
-            ushort length = GetArrayLength(); // Get the length of the string (in bytes, NOT characters)
+            int length = GetArrayLength(); // Get the length of the string (in bytes, NOT characters)
             if (UnreadLength < length)
             {
                 RiptideLogger.Log(LogType.Error, NotEnoughBytesError(StringName, "shortened string"));
-                length = (ushort)UnreadLength;
+                length = UnreadLength;
             }
             
             string value = Encoding.UTF8.GetString(Bytes, readPos, length); // Convert the bytes at readPos' position to a string
@@ -1327,7 +1350,7 @@ namespace Riptide
 
         /// <summary>Retrieves the length of an array from the message, using either 1 or 2 bytes depending on how large the array is.</summary>
         /// <returns>The length of the array.</returns>
-        private ushort GetArrayLength()
+        private int GetArrayLength()
         {
             if (UnreadLength < 1)
             {
@@ -1344,7 +1367,7 @@ namespace Riptide
                 return 0;
             }
             
-            return (ushort)(((Bytes[readPos++] << 8) | Bytes[readPos++]) & 0b_0111_1111_1111_1111); // Read the byte with the big array flag bit first, using GetUShort would add it second
+            return ((Bytes[readPos++] << 8) | Bytes[readPos++]) & 0b_0111_1111_1111_1111; // Read the byte with the big array flag bit first, using GetUShort would add it second
         }
         #endregion
 

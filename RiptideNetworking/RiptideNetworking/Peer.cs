@@ -19,8 +19,6 @@ namespace Riptide
         NoConnection,
         /// <summary>The client is already connected.</summary>
         AlreadyConnected,
-        /// <summary>A connection attempt is already pending.</summary>
-        Pending,
         /// <summary>The server is full.</summary>
         ServerFull,
         /// <summary>The connection attempt was rejected.</summary>
@@ -58,40 +56,46 @@ namespace Riptide
     {
         /// <summary>The name to use when logging messages via <see cref="RiptideLogger"/>.</summary>
         public readonly string LogName;
-        /// <summary>The time (in milliseconds) after which to disconnect if no heartbeats are received.</summary>
-        public ushort TimeoutTime { get; set; } = 5000;
+        /// <summary>Sets the relevant connections' <see cref="Connection.TimeoutTime"/>s.</summary>
+        public abstract int TimeoutTime { set; }
         /// <summary>The interval (in milliseconds) at which to send and expect heartbeats to be received.</summary>
         /// <remarks>Changes to this value will only take effect after the next heartbeat is executed.</remarks>
-        public ushort HeartbeatInterval { get; set; } = 1000;
+        public int HeartbeatInterval { get; set; } = 1000;
 
         /// <summary>The number of currently active <see cref="Server"/> and <see cref="Client"/> instances.</summary>
         internal static int ActiveCount { get; private set; }
 
+        /// <summary>The time (in milliseconds) for which to wait before giving up on a connection attempt.</summary>
+        internal int ConnectTimeoutTime { get; set; } = 10000;
         /// <summary>The current time.</summary>
         internal long CurrentTime { get; private set; }
 
         /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.NeverConnected"/>.</summary>
-        protected const string DCNeverConnected = "Never connected";
+        protected const string DCNeverConnected   = "Never connected";
         /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.TransportError"/>.</summary>
-        protected const string DCTransportError = "Transport error";
+        protected const string DCTransportError   = "Transport error";
         /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.TimedOut"/>.</summary>
-        protected const string DCTimedOut       = "Timed out";
+        protected const string DCTimedOut         = "Timed out";
         /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.Kicked"/>.</summary>
-        protected const string DCKicked         = "Kicked";
+        protected const string DCKicked           = "Kicked";
         /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.ServerStopped"/>.</summary>
-        protected const string DCServerStopped  = "Server stopped";
+        protected const string DCServerStopped    = "Server stopped";
         /// <summary>The text to log when disconnected due to <see cref="DisconnectReason.Disconnected"/>.</summary>
-        protected const string DCDisconnected   = "Disconnected";
+        protected const string DCDisconnected     = "Disconnected";
         /// <summary>The text to log when disconnected or rejected due to an unknown reason.</summary>
-        protected const string UnknownReason    = "Unknown reason";
+        protected const string UnknownReason      = "Unknown reason";
         /// <summary>The text to log when the connection failed due to <see cref="RejectReason.NoConnection"/>.</summary>
-        protected const string CRNoConnection   = "No connection";
+        protected const string CRNoConnection     = "No connection";
+        /// <summary>The text to log when the connection failed due to <see cref="RejectReason.AlreadyConnected"/>.</summary>
+        protected const string CRAlreadyConnected = "This client is already connected";
         /// <summary>The text to log when the connection failed due to <see cref="RejectReason.ServerFull"/>.</summary>
-        protected const string CRServerFull     = "Server is full";
+        protected const string CRServerFull       = "Server is full";
         /// <summary>The text to log when the connection failed due to <see cref="RejectReason.Rejected"/>.</summary>
-        protected const string CRRejected       = "Rejected";
+        protected const string CRRejected         = "Rejected";
         /// <summary>The text to log when the connection failed due to <see cref="RejectReason.Custom"/>.</summary>
-        protected const string CRCustom         = "Rejected with custom reason";
+        protected const string CRCustom           = "Rejected (with custom data)";
+        /// <summary>Whether or not the peer should use the built-in message handler system.</summary>
+        protected bool useMessageHandlers;
 
         /// <summary>A stopwatch used to track how much time has passed.</summary>
         private readonly System.Diagnostics.Stopwatch time = new System.Diagnostics.Stopwatch();
@@ -129,12 +133,14 @@ namespace Riptide
         /// <summary>Starts tracking how much time has passed.</summary>
         protected void StartTime()
         {
-            time.Start();
+            CurrentTime = 0;
+            time.Restart();
         }
 
         /// <summary>Stops tracking how much time has passed.</summary>
         protected void StopTime()
         {
+            CurrentTime = 0;
             time.Reset();
             eventQueue.Clear();
         }
@@ -173,27 +179,32 @@ namespace Riptide
         protected void HandleData(object _, DataReceivedEventArgs e)
         {
             MessageHeader header = (MessageHeader)e.DataBuffer[0];
-
-            Message message = Message.CreateRaw();
-            message.PrepareForUse(header, (ushort)e.Amount);
-
-            if (message.SendMode == MessageSendMode.Reliable)
+            Message message = Message.Create(header, e.Amount);
+            
+            if (header == MessageHeader.Notify)
             {
-                if (e.Amount < 3) // Reliable messages have a 3 byte header, if there aren't that many bytes in the packet don't handle it
+                if (e.Amount < Message.NotifyHeaderSize)
                     return;
 
-                if (e.FromConnection.ReliableHandle(Converter.ToUShort(e.DataBuffer, 1)))
-                {
-                    Array.Copy(e.DataBuffer, 1, message.Bytes, 1, e.Amount - 1); // We've already established that the packet contains at least 3 bytes, and we always want to copy the sequence ID over
-                    messagesToHandle.Enqueue(new MessageToHandle(message, header, e.FromConnection));
-                }
+                e.FromConnection.ProcessNotify(e.DataBuffer, e.Amount, message);
             }
-            else
+            else if (message.SendMode == MessageSendMode.Unreliable)
             {
-                if (e.Amount > 1) // Only bother with the array copy if there is more than 1 byte in the packet (1 or less means no payload for a reliably sent packet)
+                if (e.Amount > Message.UnreliableHeaderSize) // Only bother with the array copy if there is more than 1 byte in the packet (1 or less means no payload for a reliably sent packet)
                     Array.Copy(e.DataBuffer, 1, message.Bytes, 1, e.Amount - 1);
 
                 messagesToHandle.Enqueue(new MessageToHandle(message, header, e.FromConnection));
+            }
+            else
+            {
+                if (e.Amount < Message.ReliableHeaderSize)
+                    return;
+
+                if (e.FromConnection.ShouldHandle(Converter.ToUShort(e.DataBuffer, 1)))
+                {
+                    Array.Copy(e.DataBuffer, 1, message.Bytes, 1, e.Amount - 1);
+                    messagesToHandle.Enqueue(new MessageToHandle(message, header, e.FromConnection));
+                }
             }
         }
 
